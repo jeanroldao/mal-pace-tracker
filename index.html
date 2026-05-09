@@ -151,6 +151,10 @@
     </div>
     <div class="header-right">
       <div class="pill">
+        <label for="clientid-input">client id</label>
+        <input id="clientid-input" type="text" placeholder="MAL client id" autocomplete="off" spellcheck="false" style="width:130px">
+      </div>
+      <div class="pill">
         <label for="username-input">@</label>
         <input id="username-input" type="text" placeholder="mal username" autocomplete="off" spellcheck="false">
       </div>
@@ -175,9 +179,13 @@
 <script>
 const LS_USERNAME  = 'mal_tracker_username';
 const LS_GOAL      = 'mal_tracker_goal';
+const LS_CLIENTID  = 'mal_tracker_clientid';
 const LS_SNAP_PFX  = 'mal_snap_';
 const LS_TITLES    = 'mal_titles';
 const DEFAULT_GOAL = 10;
+
+const MAL_API  = 'https://api.myanimelist.net/v2';
+const CORS_PFX = 'https://corsproxy.io/?url=';
 
 const $ = id => document.getElementById(id);
 
@@ -197,34 +205,40 @@ function dayLabel(daysAgo) {
 }
 
 function loadSettings() {
-  $('username-input').value = localStorage.getItem(LS_USERNAME) || '';
-  $('goal-input').value     = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
+  $('username-input').value  = localStorage.getItem(LS_USERNAME) || '';
+  $('goal-input').value      = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
+  $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
 function saveSettings() {
   const u = $('username-input').value.trim();
   if (u) localStorage.setItem(LS_USERNAME, u);
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
+  const c = $('clientid-input').value.trim();
+  if (c) localStorage.setItem(LS_CLIENTID, c);
 }
 
 function getUsername() { return $('username-input').value.trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
+function getClientId() { return $('clientid-input').value.trim(); }
 
 function saveSnapshot(key, snap) { localStorage.setItem(LS_SNAP_PFX + key, JSON.stringify(snap)); }
 function loadSnapshot(key)       { const r = localStorage.getItem(LS_SNAP_PFX + key); return r ? JSON.parse(r) : null; }
 function loadTitles()            { const r = localStorage.getItem(LS_TITLES); return r ? JSON.parse(r) : {}; }
 function saveTitles(t)           { localStorage.setItem(LS_TITLES, JSON.stringify({ ...loadTitles(), ...t })); }
 
-async function fetchMangaList(username) {
-  let page = 1, all = [];
-  while (true) {
-    const res  = await fetch(`https://api.jikan.moe/v4/users/${username}/mangalist?status=1&limit=100&page=${page}`);
-    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || `HTTP ${res.status}`); }
+async function fetchMangaList(username, clientId) {
+  let all = [];
+  let url = `${MAL_API}/users/${username}/mangalist?status=reading&limit=1000&fields=list_status`;
+  while (url) {
+    const res = await fetch(CORS_PFX + encodeURIComponent(url), {
+      headers: { 'X-MAL-CLIENT-ID': clientId }
+    });
+    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || b.error || `HTTP ${res.status}`); }
     const json = await res.json();
     all.push(...(json.data || []));
-    if (!json.pagination?.has_next_page) break;
-    page++;
-    await new Promise(r => setTimeout(r, 500));
+    url = json.paging?.next || null;
+    if (url) await new Promise(r => setTimeout(r, 500));
   }
   return all;
 }
@@ -232,9 +246,9 @@ async function fetchMangaList(username) {
 function buildSnapshot(data) {
   const snap = {}, titles = {};
   data.forEach(item => {
-    const id   = String(item.manga.mal_id);
-    snap[id]   = item.chapters_read || 0;
-    titles[id] = item.manga.title;
+    const id   = String(item.node.id);
+    snap[id]   = item.list_status?.num_chapters_read || 0;
+    titles[id] = item.node.title;
   });
   return { snap, titles };
 }
@@ -333,14 +347,25 @@ function render() {
 
 async function refresh() {
   const username = getUsername();
+  const clientId = getClientId();
   if (!username) { $('main-content').innerHTML = `<p class="status-msg">enter your MAL username above to start</p>`; return; }
+  if (!clientId) {
+    $('main-content').innerHTML = `<div class="error-msg">⚠ MAL client ID required — <a href="https://myanimelist.net/apiconfig" target="_blank" style="color:inherit">register a free app at myanimelist.net/apiconfig</a> to get one, then paste it in the <strong>client id</strong> field above.</div>`;
+    $('last-updated').textContent = `@${username} · no client id`;
+    return;
+  }
+  if (!/^[a-f0-9]{32}$/i.test(clientId)) {
+    $('main-content').innerHTML = `<div class="error-msg">⚠ Invalid MAL client ID — it should be a 32-character alphanumeric string from <a href="https://myanimelist.net/apiconfig" target="_blank" style="color:inherit">myanimelist.net/apiconfig</a>.</div>`;
+    $('last-updated').textContent = `@${username} · invalid client id`;
+    return;
+  }
 
   const btn = $('refresh-btn'), spinner = $('spinner'), label = $('btn-label');
   btn.disabled = true; spinner.classList.add('active'); label.textContent = 'loading…';
   $('last-updated').textContent = `@${username} · fetching…`;
 
   try {
-    const data             = await fetchMangaList(username);
+    const data             = await fetchMangaList(username, clientId);
     const { snap, titles } = buildSnapshot(data);
     saveSnapshot(dateKey(0), snap);
     saveTitles(titles);
@@ -355,6 +380,8 @@ async function refresh() {
 }
 
 $('goal-input').addEventListener('input', () => { saveSettings(); render(); });
+
+$('clientid-input').addEventListener('input', () => { saveSettings(); });
 
 let usernameTimer;
 $('username-input').addEventListener('input', () => {
