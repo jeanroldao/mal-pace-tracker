@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAL Manga Pace Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #f5f4f0;
+    --surface: #ffffff;
+    --border: #e0ddd6;
+    --text: #1a1916;
+    --muted: #7a786f;
+    --green: #1a7a52;
+    --green-bg: #e8f5ef;
+    --red: #b84a2a;
+    --red-bg: #faeae5;
+    --accent: #2a5caa;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16150f;
+      --surface: #1f1e17;
+      --border: #2e2d25;
+      --text: #f0ede6;
+      --muted: #7a786f;
+      --green: #4bc98a;
+      --green-bg: #0d2e1e;
+      --red: #e8725a;
+      --red-bg: #2a150d;
+      --accent: #6b99e0;
+    }
+  }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem 1rem;
+  }
+
+  .container { max-width: 680px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-bottom: 2rem;
+    padding-bottom: 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-left h1 {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    margin-bottom: 3px;
+  }
+
+  .header-left p {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .goal-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+
+  .goal-group label {
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .goal-group input {
+    width: 48px;
+    border: none;
+    background: transparent;
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+    text-align: center;
+    outline: none;
+    -moz-appearance: textfield;
+  }
+  .goal-group input::-webkit-inner-spin-button,
+  .goal-group input::-webkit-outer-spin-button { -webkit-appearance: none; }
+
+  .goal-group span {
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+
+  .goal-group input[type="text"] {
+    width: 110px;
+    border: none;
+    background: transparent;
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    outline: none;
+  }
+
+  button#refresh-btn {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 14px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  button#refresh-btn:hover { background: var(--border); }
+  button#refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .spinner {
+    width: 12px; height: 12px;
+    border: 1.5px solid var(--border);
+    border-top-color: var(--muted);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }
+  .spinner.active { display: inline-block; }
+
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 1.5rem;
+  }
+
+  @media (max-width: 500px) {
+    .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  .metric {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+
+  .metric-label {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+
+  .metric-value {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--text);
+  }
+
+  .metric-value.ahead { color: var(--green); }
+  .metric-value.behind { color: var(--red); }
+
+  .metric-sub {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  .section-label {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-bottom: 10px;
+  }
+
+  .days-table { width: 100%; margin-bottom: 1.75rem; }
+
+  .day-row {
+    display: grid;
+    grid-template-columns: 90px 1fr 36px 52px;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .day-row:last-child { border-bottom: none; }
+
+  .day-name {
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+  .day-name.today { color: var(--text); font-weight: 500; }
+
+  .bar-track {
+    height: 6px;
+    background: var(--bg);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--green);
+    transition: width 0.5s cubic-bezier(0.4,0,0.2,1);
+  }
+  .bar-fill.miss { background: var(--red); }
+  .bar-fill.zero { width: 0 !important; }
+
+  .day-count {
+    font-size: 13px;
+    font-family: var(--mono);
+    font-weight: 500;
+    color: var(--text);
+    text-align: right;
+  }
+
+  .day-delta {
+    font-size: 11px;
+    font-family: var(--mono);
+    text-align: right;
+  }
+  .day-delta.pos { color: var(--green); }
+  .day-delta.neg { color: var(--red); }
+  .day-delta.zero { color: var(--muted); }
+
+  .today-section { margin-bottom: 1.5rem; }
+
+  .manga-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+  }
+  .manga-row:last-child { border-bottom: none; }
+
+  .manga-title {
+    font-size: 13px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .manga-ch {
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  .status-msg {
+    font-size: 13px;
+    font-family: var(--mono);
+    color: var(--muted);
+    padding: 2rem 0;
+    text-align: center;
+  }
+
+  .error-msg {
+    font-size: 13px;
+    font-family: var(--mono);
+    color: var(--red);
+    padding: 1rem 0;
+    background: var(--red-bg);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 1rem;
+  }
+
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    font-family: var(--mono);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+  .tag.on-track { background: var(--green-bg); color: var(--green); }
+  .tag.behind { background: var(--red-bg); color: var(--red); }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="header-left">
+      <h1>manga pace tracker</h1>
+      <p id="last-updated">@jeanfarias · not yet loaded</p>
+    </div>
+    <div class="header-right">
+      <div class="goal-group">
+        <label for="username-input">@</label>
+        <input id="username-input" type="text" placeholder="mal username" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="goal-group">
+        <label for="goal-input">goal</label>
+        <input id="goal-input" type="number" min="1" max="999" value="10">
+        <span>ch/day</span>
+      </div>
+      <button id="refresh-btn">
+        <span class="spinner" id="spinner"></span>
+        <span id="btn-label">↻ refresh</span>
+      </button>
+    </div>
+  </header>
+
+  <div id="main-content">
+    <p class="status-msg" id="status">loading…</p>
+  </div>
+
+</div>
+
+<script>
+const LS_USERNAME = 'mal_tracker_username';
+const LS_GOAL     = 'mal_tracker_goal';
+const DEFAULT_USERNAME = 'jeanfarias';
+const DEFAULT_GOAL = 10;
+
+const $ = id => document.getElementById(id);
+const escapeHtml = value => String(value)
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#39;');
+
+function loadSettings() {
+  const username = localStorage.getItem(LS_USERNAME) || DEFAULT_USERNAME;
+  const goal     = parseInt(localStorage.getItem(LS_GOAL)) || DEFAULT_GOAL;
+  $('username-input').value = username;
+  $('goal-input').value = goal;
+  return { username, goal };
+}
+
+function saveSettings() {
+  localStorage.setItem(LS_USERNAME, $('username-input').value.trim() || DEFAULT_USERNAME);
+  localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
+}
+
+function getUsername() { return ($('username-input').value.trim() || DEFAULT_USERNAME); }
+function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function toLocalKey(dateStr) {
+  const d = new Date(dateStr);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function dayLabel(d, isToday) {
+  if (isToday) return 'today';
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${days[d.getDay()]} ${months[d.getMonth()]} ${d.getDate()}`;
+}
+
+let cachedHistory = null;
+
+async function fetchHistory(username) {
+  const res = await fetch(`https://api.jikan.moe/v4/users/${username}/history/manga`);
+  if (!res.ok) throw new Error(`Jikan API error: HTTP ${res.status}`);
+  const json = await res.json();
+  return json.data || [];
+}
+
+function processData(history, goal) {
+  const byDay = {};
+  const titlesByDay = {};
+
+  history.forEach(item => {
+    const key = toLocalKey(item.date);
+    const increment = Number(item.increment) || 0;
+    byDay[key] = (byDay[key] || 0) + increment;
+    if (!titlesByDay[key]) titlesByDay[key] = {};
+    const title = item.entry?.title || 'Unknown';
+    titlesByDay[key][title] = (titlesByDay[key][title] || 0) + increment;
+  });
+
+  const today = todayKey();
+  const last7 = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    last7.push({ key, date: d, count: byDay[key] || 0, isToday: key === today });
+  }
+
+  const weekTotal = last7.reduce((s, d) => s + d.count, 0);
+  const weekGoal = goal * 7;
+  const todayCount = byDay[today] || 0;
+  const todayTitles = titlesByDay[today] || {};
+
+  let cumDelta = 0;
+  const last7WithDelta = last7.map(d => {
+    cumDelta += d.count - goal;
+    return { ...d, cumDelta };
+  });
+
+  const dailyAvg = Math.round((weekTotal / 7) * 10) / 10;
+
+  return { last7: last7WithDelta, weekTotal, weekGoal, weekDelta: weekTotal - weekGoal, todayCount, todayTitles, dailyAvg };
+}
+
+function render(history) {
+  const g = getGoal();
+  const username = getUsername();
+  const { last7, weekTotal, weekGoal, weekDelta, todayCount, todayTitles, dailyAvg } = processData(history, g);
+
+  const todayOnTrack = todayCount >= g;
+  const maxBar = Math.max(g * 1.5, ...last7.map(d => d.count), 1);
+
+  const todayTitlesSorted = Object.entries(todayTitles).sort((a,b) => b[1]-a[1]);
+
+  $('main-content').innerHTML = `
+    <div class="metrics-grid">
+      <div class="metric">
+        <div class="metric-label">today</div>
+        <div class="metric-value ${todayOnTrack ? 'ahead' : 'behind'}">${todayCount}</div>
+        <div class="metric-sub">of ${g} ch</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">7-day total</div>
+        <div class="metric-value">${weekTotal}</div>
+        <div class="metric-sub">of ${weekGoal} ch</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">pace (7d)</div>
+        <div class="metric-value ${weekDelta >= 0 ? 'ahead' : 'behind'}">${weekDelta >= 0 ? '+' : ''}${weekDelta}</div>
+        <div class="metric-sub">${weekDelta >= 0 ? 'ahead' : 'behind'}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">avg/day</div>
+        <div class="metric-value">${dailyAvg}</div>
+        <div class="metric-sub">ch/day</div>
+      </div>
+    </div>
+
+    <div class="section-label" style="margin-bottom:10px">last 7 days — bar marks goal, right column = cumulative delta</div>
+    <div class="days-table">
+      ${last7.map(d => `
+        <div class="day-row">
+          <span class="day-name ${d.isToday ? 'today' : ''}">${dayLabel(d.date, d.isToday)}</span>
+          <div class="bar-track">
+            <div class="bar-fill ${d.count < g ? 'miss' : ''} ${d.count === 0 ? 'zero' : ''}"
+                 style="width:${Math.min(100, (d.count / maxBar) * 100).toFixed(1)}%"></div>
+          </div>
+          <span class="day-count">${d.count}</span>
+          <span class="day-delta ${d.cumDelta > 0 ? 'pos' : d.cumDelta < 0 ? 'neg' : 'zero'}">
+            ${d.cumDelta > 0 ? '+' : ''}${d.cumDelta}
+          </span>
+        </div>
+      `).join('')}
+    </div>
+
+    ${todayTitlesSorted.length > 0 ? `
+      <div class="today-section">
+        <div class="section-label">today's reading</div>
+        ${todayTitlesSorted.map(([title, count]) => `
+          <div class="manga-row">
+            <span class="manga-title">${escapeHtml(title)}</span>
+            <span class="manga-ch">${count} ch</span>
+          </div>
+        `).join('')}
+      </div>
+    ` : ''}
+  `;
+}
+
+async function refresh() {
+  const btn = $('refresh-btn');
+  const spinner = $('spinner');
+  const label = $('btn-label');
+  const username = getUsername();
+
+  btn.disabled = true;
+  spinner.classList.add('active');
+  label.textContent = 'loading…';
+  $('last-updated').textContent = `@${username} · loading…`;
+
+  try {
+    cachedHistory = await fetchHistory(username);
+    render(cachedHistory);
+    const now = new Date();
+    $('last-updated').textContent = `@${username} · updated ${now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+  } catch(e) {
+    $('main-content').innerHTML = `<div class="error-msg">⚠ ${e.message}</div>`;
+    $('last-updated').textContent = `@${username} · error`;
+  } finally {
+    btn.disabled = false;
+    spinner.classList.remove('active');
+    label.textContent = '↻ refresh';
+  }
+}
+
+$('goal-input').addEventListener('input', () => {
+  saveSettings();
+  if (cachedHistory) render(cachedHistory);
+});
+
+let usernameTimer;
+$('username-input').addEventListener('input', () => {
+  saveSettings();
+  clearTimeout(usernameTimer);
+  usernameTimer = setTimeout(() => {
+    cachedHistory = null;
+    refresh();
+  }, 800);
+});
+
+$('refresh-btn').addEventListener('click', refresh);
+
+loadSettings();
+refresh();
+</script>
+</body>
+</html>
