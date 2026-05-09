@@ -361,7 +361,6 @@
 <script>
 const LS_USERNAME = 'mal_tracker_username';
 const LS_GOAL     = 'mal_tracker_goal';
-const DEFAULT_USERNAME = 'mal-username';
 const DEFAULT_GOAL = 10;
 const USERNAME_PROMPT = 'set your MAL username to load reading history';
 
@@ -374,7 +373,7 @@ const escapeHtml = value => String(value)
   .replaceAll("'", '&#39;');
 
 function loadSettings() {
-  const username = localStorage.getItem(LS_USERNAME) || DEFAULT_USERNAME;
+  const username = localStorage.getItem(LS_USERNAME) || '';
   const goal     = parseInt(localStorage.getItem(LS_GOAL)) || DEFAULT_GOAL;
   $('username-input').value = username;
   $('goal-input').value = goal;
@@ -382,11 +381,11 @@ function loadSettings() {
 }
 
 function saveSettings() {
-  localStorage.setItem(LS_USERNAME, $('username-input').value.trim() || DEFAULT_USERNAME);
+  localStorage.setItem(LS_USERNAME, $('username-input').value.trim());
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
 }
 
-function getUsername() { return ($('username-input').value.trim() || DEFAULT_USERNAME); }
+function getUsername() { return $('username-input').value.trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
 
 function todayKey() {
@@ -523,7 +522,7 @@ async function refresh() {
   const spinner = $('spinner');
   const label = $('btn-label');
   const username = getUsername();
-  if (username === DEFAULT_USERNAME) {
+  if (!username) {
     $('main-content').innerHTML = `<p class="status-msg">${USERNAME_PROMPT}</p>`;
     $('last-updated').textContent = 'username not configured';
     return;
@@ -567,7 +566,7 @@ $('username-input').addEventListener('input', () => {
 $('refresh-btn').addEventListener('click', refresh);
 
 loadSettings();
-if (getUsername() === DEFAULT_USERNAME) {
+if (!getUsername()) {
   $('main-content').innerHTML = `<p class="status-msg">${USERNAME_PROMPT}</p>`;
 } else {
   refresh();
