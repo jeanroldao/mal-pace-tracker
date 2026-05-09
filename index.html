@@ -361,8 +361,9 @@
 <script>
 const LS_USERNAME = 'mal_tracker_username';
 const LS_GOAL     = 'mal_tracker_goal';
-const DEFAULT_USERNAME = 'your-username';
+const DEFAULT_USERNAME = 'mal-username';
 const DEFAULT_GOAL = 10;
+const USERNAME_PROMPT = 'set your MAL username to load reading history';
 
 const $ = id => document.getElementById(id);
 const escapeHtml = value => String(value)
@@ -523,7 +524,7 @@ async function refresh() {
   const label = $('btn-label');
   const username = getUsername();
   if (username === DEFAULT_USERNAME) {
-    $('main-content').innerHTML = '<p class="status-msg">set your MAL username to load reading history</p>';
+    $('main-content').innerHTML = `<p class="status-msg">${USERNAME_PROMPT}</p>`;
     $('last-updated').textContent = 'username not configured';
     return;
   }
@@ -567,7 +568,7 @@ $('refresh-btn').addEventListener('click', refresh);
 
 loadSettings();
 if (getUsername() === DEFAULT_USERNAME) {
-  $('main-content').innerHTML = '<p class="status-msg">set your MAL username to load reading history</p>';
+  $('main-content').innerHTML = `<p class="status-msg">${USERNAME_PROMPT}</p>`;
 } else {
   refresh();
 }
