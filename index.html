@@ -408,7 +408,8 @@ function dayLabel(d, isToday) {
 let cachedHistory = null;
 
 async function fetchHistory(username) {
-  const res = await fetch(`https://api.jikan.moe/v4/users/${username}/history/manga`);
+  const safeUsername = encodeURIComponent(username);
+  const res = await fetch(`https://api.jikan.moe/v4/users/${safeUsername}/history/manga`);
   if (!res.ok) throw new Error(`Jikan API error: HTTP ${res.status}`);
   const json = await res.json();
   return json.data || [];
