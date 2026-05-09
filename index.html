@@ -184,8 +184,9 @@ const LS_SNAP_PFX  = 'mal_snap_';
 const LS_TITLES    = 'mal_titles';
 const DEFAULT_GOAL = 10;
 
-const MAL_API  = 'https://api.myanimelist.net/v2';
-const CORS_PFX = 'https://corsproxy.io/?url=';
+const MAL_API   = 'https://api.myanimelist.net/v2';
+const JIKAN_API = 'https://api.jikan.moe/v4';
+const CORS_PFX  = 'https://corsproxy.io/?url=';
 
 const $ = id => document.getElementById(id);
 
@@ -251,6 +252,50 @@ function buildSnapshot(data) {
     titles[id] = item.node.title;
   });
   return { snap, titles };
+}
+
+async function fetchJikanHistory(username) {
+  try {
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga`);
+    if (!res.ok) return [];
+    const json = await res.json();
+    return json.data || [];
+  } catch (_) { return []; }
+}
+
+function groupHistoryByDay(historyData) {
+  const byDay = {}, titles = {};
+  historyData.forEach(entry => {
+    const day       = entry.date.slice(0, 10); // 'YYYY-MM-DD'
+    const mangaId   = String(entry.entry.mal_id);
+    const increment = entry.increment || 0;
+    if (!byDay[day]) byDay[day] = {};
+    byDay[day][mangaId] = (byDay[day][mangaId] || 0) + increment;
+    if (entry.entry.name) titles[mangaId] = entry.entry.name;
+  });
+  return { byDay, titles };
+}
+
+// Reconstruct past daily snapshots by working backwards from currentSnap,
+// subtracting each day's increments. Only fills days that have no stored snapshot.
+function backfillSnapshots(currentSnap, historyByDay) {
+  let rollingSnap = { ...currentSnap };
+  for (let i = 1; i <= 6; i++) {
+    const key      = dateKey(i);
+    const existing = loadSnapshot(key);
+    if (existing) {
+      rollingSnap = existing;
+      continue;
+    }
+    // Subtract increments from dateKey(i-1) to derive dateKey(i)
+    const dayIncrements = historyByDay[dateKey(i - 1)] || {};
+    const prevSnap = {};
+    Object.keys(rollingSnap).forEach(id => {
+      prevSnap[id] = Math.max(0, (rollingSnap[id] || 0) - (dayIncrements[id] || 0));
+    });
+    saveSnapshot(key, prevSnap);
+    rollingSnap = prevSnap;
+  }
 }
 
 function computeDiff(snapA, snapB, titles) {
@@ -369,6 +414,12 @@ async function refresh() {
     const { snap, titles } = buildSnapshot(data);
     saveSnapshot(dateKey(0), snap);
     saveTitles(titles);
+
+    const historyData                    = await fetchJikanHistory(username);
+    const { byDay, titles: jikanTitles } = groupHistoryByDay(historyData);
+    saveTitles(jikanTitles);
+    backfillSnapshots(snap, byDay);
+
     render();
     $('last-updated').textContent = `@${username} · updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
   } catch(e) {
