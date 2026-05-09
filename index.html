@@ -333,7 +333,7 @@
   <header>
     <div class="header-left">
       <h1>manga pace tracker</h1>
-      <p id="last-updated">@user · not yet loaded</p>
+      <p id="last-updated">not yet loaded</p>
     </div>
     <div class="header-right">
       <div class="goal-group">
@@ -361,7 +361,7 @@
 <script>
 const LS_USERNAME = 'mal_tracker_username';
 const LS_GOAL     = 'mal_tracker_goal';
-const DEFAULT_USERNAME = 'jeanfarias';
+const DEFAULT_USERNAME = 'your-username';
 const DEFAULT_GOAL = 10;
 
 const $ = id => document.getElementById(id);
@@ -522,6 +522,11 @@ async function refresh() {
   const spinner = $('spinner');
   const label = $('btn-label');
   const username = getUsername();
+  if (username === DEFAULT_USERNAME) {
+    $('main-content').innerHTML = '<p class="status-msg">set your MAL username to load reading history</p>';
+    $('last-updated').textContent = 'username not configured';
+    return;
+  }
 
   btn.disabled = true;
   spinner.classList.add('active');
@@ -561,7 +566,11 @@ $('username-input').addEventListener('input', () => {
 $('refresh-btn').addEventListener('click', refresh);
 
 loadSettings();
-refresh();
+if (getUsername() === DEFAULT_USERNAME) {
+  $('main-content').innerHTML = '<p class="status-msg">set your MAL username to load reading history</p>';
+} else {
+  refresh();
+}
 </script>
 </body>
 </html>
