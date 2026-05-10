@@ -182,7 +182,11 @@ const LS_GOAL      = 'mal_tracker_goal';
 const LS_CLIENTID  = 'mal_tracker_clientid';
 const LS_SNAP_PFX  = 'mal_snap_';
 const LS_TITLES    = 'mal_titles';
-const DEFAULT_GOAL = 10;
+const DEFAULT_GOAL         = 10;
+const AUTO_REFRESH_MS      = 30 * 60 * 1000; // 30 minutes
+
+let autoRefreshTimer = null;
+let isRefreshing = false;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const JIKAN_API = 'https://api.jikan.moe/v4';
@@ -340,7 +344,7 @@ function render() {
     <div class="metrics-grid">
       <div class="metric">
         <div class="metric-label">today</div>
-        <div class="metric-value ${todayEntry.count === null ? '' : todayEntry.count >= goal ? 'ahead' : 'behind'}">${todayEntry.count ?? '—'}</div>
+        <div class="metric-value ${isRefreshing ? '' : todayEntry.count === null ? '' : todayEntry.count >= goal ? 'ahead' : 'behind'}">${isRefreshing ? '···' : todayEntry.count ?? '—'}</div>
         <div class="metric-sub">of ${goal} ch</div>
       </div>
       <div class="metric">
@@ -408,8 +412,17 @@ async function refresh() {
   const btn = $('refresh-btn'), spinner = $('spinner'), label = $('btn-label');
   btn.disabled = true; spinner.classList.add('active'); label.textContent = 'loading…';
   $('last-updated').textContent = `@${username} · fetching…`;
+  isRefreshing = true;
+  render();
 
   try {
+    // Option 2: if we have a stale today-snapshot but no yesterday snapshot, the stale
+    // snapshot is likely from the previous day — promote it to yesterday before overwriting.
+    const prevTodaySnap = loadSnapshot(dateKey(0));
+    if (prevTodaySnap && !loadSnapshot(dateKey(1))) {
+      saveSnapshot(dateKey(1), prevTodaySnap);
+    }
+
     const data             = await fetchMangaList(username, clientId);
     const { snap, titles } = buildSnapshot(data);
     saveSnapshot(dateKey(0), snap);
@@ -420,9 +433,27 @@ async function refresh() {
     saveTitles(jikanTitles);
     backfillSnapshots(snap, byDay);
 
+    // Option 1: if yesterday's snapshot is still missing but Jikan returned today's
+    // increments, derive yesterday's snapshot by subtracting them from today's snapshot.
+    if (!loadSnapshot(dateKey(1)) && byDay[dateKey(0)]) {
+      const todayIncrements = byDay[dateKey(0)];
+      const derivedYesterday = {};
+      const allIds = new Set([...Object.keys(snap), ...Object.keys(todayIncrements)]);
+      allIds.forEach(id => {
+        derivedYesterday[id] = Math.max(0, (snap[id] || 0) - (todayIncrements[id] || 0));
+      });
+      saveSnapshot(dateKey(1), derivedYesterday);
+    }
+
+    isRefreshing = false;
     render();
     $('last-updated').textContent = `@${username} · updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+
+    // Option 3: auto-refresh every 30 minutes to keep today's data current.
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(() => refresh(), AUTO_REFRESH_MS);
   } catch(e) {
+    isRefreshing = false;
     $('main-content').innerHTML = `<div class="error-msg">⚠ ${e.message}</div>`;
     $('last-updated').textContent = `@${username} · error`;
   } finally {
