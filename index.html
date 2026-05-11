@@ -282,6 +282,10 @@ function groupHistoryByDay(historyData) {
 
 // Reconstruct past daily snapshots by working backwards from currentSnap,
 // subtracting each day's increments. Only fills days that have no stored snapshot.
+// Yesterday (i=1) is intentionally not saved here: the Jikan history API often has
+// a propagation delay, so today's increments may be absent, which would cause a
+// derived "yesterday" identical to today and produce a false 0 for today's count.
+// Option 1 (below) handles yesterday only when Jikan actually has today's data.
 function backfillSnapshots(currentSnap, historyByDay) {
   let rollingSnap = { ...currentSnap };
   for (let i = 1; i <= 6; i++) {
@@ -297,7 +301,8 @@ function backfillSnapshots(currentSnap, historyByDay) {
     Object.keys(rollingSnap).forEach(id => {
       prevSnap[id] = Math.max(0, (rollingSnap[id] || 0) - (dayIncrements[id] || 0));
     });
-    saveSnapshot(key, prevSnap);
+    // Don't save yesterday here — let Option 1 handle it with its non-empty data guard.
+    if (i > 1) saveSnapshot(key, prevSnap);
     rollingSnap = prevSnap;
   }
 }
