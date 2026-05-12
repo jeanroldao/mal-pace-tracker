@@ -469,7 +469,10 @@ async function refresh() {
         const capped = Math.min(snap[id] || 0, (corrected[id] || 0) + (entry.increment || 0));
         if (capped !== corrected[id]) { corrected[id] = capped; changed = true; }
       });
-      if (changed) saveSnapshot(dateKey(1), corrected);
+      if (changed) {
+        saveSnapshot(dateKey(1), corrected);
+        localStorage.setItem(LS_SNAP_TS_PFX + dateKey(1), Date.now());
+      }
     }
 
     isRefreshing = false;
