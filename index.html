@@ -181,6 +181,7 @@ const LS_USERNAME  = 'mal_tracker_username';
 const LS_GOAL      = 'mal_tracker_goal';
 const LS_CLIENTID  = 'mal_tracker_clientid';
 const LS_SNAP_PFX  = 'mal_snap_';
+const LS_SNAP_TS_PFX = 'mal_snap_ts_';
 const LS_TITLES    = 'mal_titles';
 const DEFAULT_GOAL         = 10;
 const AUTO_REFRESH_MS      = 30 * 60 * 1000; // 30 minutes
@@ -431,6 +432,7 @@ async function refresh() {
     const data             = await fetchMangaList(username, clientId);
     const { snap, titles } = buildSnapshot(data);
     saveSnapshot(dateKey(0), snap);
+    localStorage.setItem(LS_SNAP_TS_PFX + dateKey(0), Date.now()); // Unix epoch ms
     saveTitles(titles);
 
     const historyData                    = await fetchJikanHistory(username);
@@ -448,6 +450,26 @@ async function refresh() {
         derivedYesterday[id] = Math.max(0, (snap[id] || 0) - (todayIncrements[id] || 0));
       });
       saveSnapshot(dateKey(1), derivedYesterday);
+    }
+
+    // Option 4: if yesterday's snapshot exists but was saved before the user finished
+    // reading (e.g. saved by the 30-min auto-refresh early in the day), apply any
+    // Jikan history entries for yesterday that were recorded *after* the snapshot
+    // timestamp.  Each increment is capped at today's count to avoid over-counting.
+    const yesterdaySnap = loadSnapshot(dateKey(1));
+    const yesterdayTsRaw = localStorage.getItem(LS_SNAP_TS_PFX + dateKey(1));
+    if (yesterdaySnap && yesterdayTsRaw) {
+      const savedAt = parseInt(yesterdayTsRaw, 10);
+      const corrected = { ...yesterdaySnap };
+      let changed = false;
+      historyData.forEach(entry => {
+        if (entry.date.slice(0, 10) !== dateKey(1)) return;
+        if (new Date(entry.date).getTime() <= savedAt) return;
+        const id = String(entry.entry.mal_id);
+        const capped = Math.min(snap[id] || 0, (corrected[id] || 0) + (entry.increment || 0));
+        if (capped !== corrected[id]) { corrected[id] = capped; changed = true; }
+      });
+      if (changed) saveSnapshot(dateKey(1), corrected);
     }
 
     isRefreshing = false;
