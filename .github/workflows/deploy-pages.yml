@@ -2,7 +2,7 @@ name: Deploy static page to GitHub Pages
 
 on:
   push:
-    branches: ["main", "claude/fix-chapters-per-day-UhhKy"]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
