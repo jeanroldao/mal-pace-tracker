@@ -183,6 +183,7 @@ const LS_CLIENTID  = 'mal_tracker_clientid';
 const LS_SNAP_PFX  = 'mal_snap_';
 const LS_SNAP_TS_PFX = 'mal_snap_ts_';
 const LS_TITLES    = 'mal_titles';
+const LS_JIKAN_HISTORY = 'mal_jikan_history';
 const DEFAULT_GOAL         = 10;
 const AUTO_REFRESH_MS      = 30 * 60 * 1000; // 30 minutes
 
@@ -236,10 +237,12 @@ function saveSnapshot(key, snap) { localStorage.setItem(LS_SNAP_PFX + key, JSON.
 function loadSnapshot(key)       { const r = localStorage.getItem(LS_SNAP_PFX + key); return r ? JSON.parse(r) : null; }
 function loadTitles()            { const r = localStorage.getItem(LS_TITLES); return r ? JSON.parse(r) : {}; }
 function saveTitles(t)           { localStorage.setItem(LS_TITLES, JSON.stringify({ ...loadTitles(), ...t })); }
+function saveJikanByDay(byDay)   { localStorage.setItem(LS_JIKAN_HISTORY, JSON.stringify(byDay)); }
+function loadJikanByDay()        { const r = localStorage.getItem(LS_JIKAN_HISTORY); return r ? JSON.parse(r) : {}; }
 
 async function fetchMangaList(username, clientId) {
   let all = [];
-  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status&status=reading`;
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status`;
   while (url) {
     const res = await fetch(CORS_PFX + encodeURIComponent(url), {
       headers: { 'X-MAL-CLIENT-ID': clientId }
@@ -255,11 +258,12 @@ async function fetchMangaList(username, clientId) {
 
 function buildSnapshot(data) {
   const snap = {}, titles = {};
-  // Only "reading" entries are fetched from the API, so every item here is active.
-  // The completed/dropped guard below is kept as a safety net in case the API ever
-  // returns mixed statuses; entries with terminal statuses that haven't been touched
-  // within the 8-day window are excluded to prevent stale chapter-count divergence
-  // from falsely crediting thousands of chapters to "today".
+  // Exclude manga with terminal statuses (completed / dropped) that haven't been
+  // touched within the 8-day tracking window.  These entries never gain new chapters
+  // and, if their stored num_chapters_read ever diverges from an older snapshot
+  // (e.g. the user bulk-corrected chapter counts on MAL), the diff would falsely
+  // credit thousands of chapters to "today".  Manga completed or dropped within the
+  // last 8 days are still included so that the completion-day reading counts.
   const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000;
   data.forEach(item => {
     const status    = item.list_status?.status;
@@ -339,13 +343,41 @@ function render() {
 
   const last7  = [];
   let cumDelta = 0;
+  const jikanByDay = loadJikanByDay();
   for (let i = 6; i >= 0; i--) {
-    const snapCurr = loadSnapshot(dateKey(i));
-    const snapPrev = loadSnapshot(dateKey(i + 1));
-    const diff     = computeDiff(snapPrev, snapCurr, titles);
-    const count    = diff ? diff.total : null;
+    let count = null, byTitle = {};
+
+    if (i === 0) {
+      // Today: Jikan has propagation delays, so use the snapshot diff which reflects
+      // the most recent reading state (including manga just completed today).
+      const snapCurr = loadSnapshot(dateKey(0));
+      const snapPrev = loadSnapshot(dateKey(1));
+      const diff     = computeDiff(snapPrev, snapCurr, titles);
+      if (diff) { count = diff.total; byTitle = diff.byTitle; }
+    } else {
+      // Past days: use Jikan history directly — it records the exact date each
+      // chapter was read, so it correctly attributes chapters to the day they were
+      // actually read rather than the day a snapshot was taken.
+      const jikanDay = jikanByDay[dateKey(i)];
+      if (jikanDay && Object.keys(jikanDay).length > 0) {
+        count = 0;
+        Object.entries(jikanDay).forEach(([id, ch]) => {
+          if (ch > 0) {
+            count += ch;
+            const t = titles[id] || `id:${id}`;
+            byTitle[t] = (byTitle[t] || 0) + ch;
+          }
+        });
+      } else {
+        // Fallback to snapshot diff when Jikan has no data for this day.
+        const snapCurr = loadSnapshot(dateKey(i));
+        const snapPrev = loadSnapshot(dateKey(i + 1));
+        const diff     = computeDiff(snapPrev, snapCurr, titles);
+        if (diff) { count = diff.total; byTitle = diff.byTitle; }
+      }
+    }
     if (count !== null) cumDelta += count - goal;
-    last7.push({ label: dayLabel(i), isToday: i === 0, count, cumDelta: count !== null ? cumDelta : null, byTitle: diff?.byTitle || {} });
+    last7.push({ label: dayLabel(i), isToday: i === 0, count, cumDelta: count !== null ? cumDelta : null, byTitle });
   }
 
   const known     = last7.filter(d => d.count !== null);
@@ -457,6 +489,7 @@ async function refresh() {
 
     const historyData                    = await fetchJikanHistory(username);
     const { byDay, titles: jikanTitles } = groupHistoryByDay(historyData);
+    saveJikanByDay(byDay);
     saveTitles(jikanTitles);
     backfillSnapshots(snap, byDay);
 
