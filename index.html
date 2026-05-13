@@ -239,7 +239,7 @@ function saveTitles(t)           { localStorage.setItem(LS_TITLES, JSON.stringif
 
 async function fetchMangaList(username, clientId) {
   let all = [];
-  let url = `${MAL_API}/users/${username}/mangalist?status=reading&limit=1000&fields=list_status`;
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status`;
   while (url) {
     const res = await fetch(CORS_PFX + encodeURIComponent(url), {
       headers: { 'X-MAL-CLIENT-ID': clientId }
