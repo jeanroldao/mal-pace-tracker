@@ -346,7 +346,7 @@ function render() {
     let diff       = computeDiff(snapPrev, snapCurr, titles);
     // For today, prefer Jikan history but supplement with snapshot diff for manga
     // not yet propagated to Jikan (e.g. recently updated chapters).
-    if (i === 0 && todayHistoryData !== null) {
+    if (i === 0 && todayHistoryData && Object.keys(todayHistoryData).length > 0) {
       const byId = { ...todayHistoryData };
       if (snapCurr && snapPrev) {
         Object.keys(snapCurr).forEach(id => {
