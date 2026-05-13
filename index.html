@@ -184,6 +184,8 @@ const LS_SNAP_PFX  = 'mal_snap_';
 const LS_SNAP_TS_PFX = 'mal_snap_ts_';
 const LS_TITLES    = 'mal_titles';
 const LS_JIKAN_HISTORY = 'mal_jikan_history';
+const LS_SCHEMA_VERSION = 'mal_schema_version';
+const SCHEMA_VERSION       = '2';
 const DEFAULT_GOAL         = 10;
 const AUTO_REFRESH_MS      = 30 * 60 * 1000; // 30 minutes
 
@@ -219,6 +221,21 @@ function loadSettings() {
   $('username-input').value  = localStorage.getItem(LS_USERNAME) || '';
   $('goal-input').value      = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
+}
+
+// One-time clean-up of caches written by older versions that misinterpreted
+// Jikan's `increment` field (it's the chapter number, not a delta) and inflated
+// per-day chapter counts. Drop stored snapshots, snapshot timestamps, and the
+// Jikan history cache so the corrected logic rebuilds from scratch. User
+// settings (username, client id, goal) are preserved.
+function migrateIfNeeded() {
+  if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
+  Object.keys(localStorage)
+    .filter(k => k === LS_JIKAN_HISTORY
+              || k.startsWith(LS_SNAP_PFX)
+              || k.startsWith(LS_SNAP_TS_PFX))
+    .forEach(k => localStorage.removeItem(k));
+  localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
 }
 
 function saveSettings() {
@@ -287,13 +304,18 @@ async function fetchJikanHistory(username) {
 }
 
 function groupHistoryByDay(historyData) {
+  // Jikan's `increment` field is the chapter NUMBER recorded by each MAL
+  // history entry (e.g. "Read chapter 47" -> increment=47), NOT a count of
+  // chapters added. Summing the increments adds chapter numbers together
+  // (1+2+3=6 instead of 3 chapters), which inflates daily totals into the
+  // thousands. Each history entry represents one chapter read, so the daily
+  // count for a manga is the number of entries on that day.
   const byDay = {}, titles = {};
   historyData.forEach(entry => {
-    const day       = dateToKey(new Date(entry.date)); // local date 'YYYY-MM-DD'
-    const mangaId   = String(entry.entry.mal_id);
-    const increment = entry.increment || 0;
+    const day     = dateToKey(new Date(entry.date)); // local date 'YYYY-MM-DD'
+    const mangaId = String(entry.entry.mal_id);
     if (!byDay[day]) byDay[day] = {};
-    byDay[day][mangaId] = (byDay[day][mangaId] || 0) + increment;
+    byDay[day][mangaId] = (byDay[day][mangaId] || 0) + 1;
     if (entry.entry.name) titles[mangaId] = entry.entry.name;
   });
   return { byDay, titles };
@@ -348,12 +370,33 @@ function render() {
     let count = null, byTitle = {};
 
     if (i === 0) {
-      // Today: Jikan has propagation delays, so use the snapshot diff which reflects
-      // the most recent reading state (including manga just completed today).
-      const snapCurr = loadSnapshot(dateKey(0));
-      const snapPrev = loadSnapshot(dateKey(1));
-      const diff     = computeDiff(snapPrev, snapCurr, titles);
-      if (diff) { count = diff.total; byTitle = diff.byTitle; }
+      // Today: snapshot diff gives the exact chapter delta and catches reads
+      // that haven't propagated to Jikan yet, but it also reflects pure
+      // metadata edits (e.g. user bulk-sets a manga's num_chapters_read or
+      // changes status into "reading") which can falsely credit hundreds of
+      // chapters to today. Use Jikan as an "actually-read" signal: per-manga
+      // diff only counts when there's at least one Jikan history entry for
+      // that manga today. If Jikan has no today data at all, fall back to the
+      // raw snapshot diff so very recent reads aren't lost to propagation lag.
+      const snapCurr   = loadSnapshot(dateKey(0));
+      const snapPrev   = loadSnapshot(dateKey(1));
+      const jikanToday = jikanByDay[dateKey(0)] || {};
+      if (snapCurr && snapPrev) {
+        if (Object.keys(jikanToday).length === 0) {
+          const diff = computeDiff(snapPrev, snapCurr, titles);
+          if (diff) { count = diff.total; byTitle = diff.byTitle; }
+        } else {
+          count = 0;
+          Object.keys(jikanToday).forEach(id => {
+            const d = (snapCurr[id] || 0) - (snapPrev[id] || 0);
+            if (d > 0) {
+              count += d;
+              const t = titles[id] || `id:${id}`;
+              byTitle[t] = (byTitle[t] || 0) + d;
+            }
+          });
+        }
+      }
     } else {
       // Past days: use Jikan history directly — it records the exact date each
       // chapter was read, so it correctly attributes chapters to the day they were
@@ -507,7 +550,10 @@ async function refresh() {
         if (dateToKey(new Date(entry.date)) !== dateKey(1)) return;
         if (new Date(entry.date).getTime() <= savedAt) return;
         const id = String(entry.entry.mal_id);
-        const capped = Math.min(snap[id] || 0, (corrected[id] || 0) + (entry.increment || 0));
+        // Each Jikan entry represents one chapter read (the entry's
+        // `increment` is the chapter number, not a delta), so bump
+        // yesterday's recorded count by 1 per entry, capped at today's.
+        const capped = Math.min(snap[id] || 0, (corrected[id] || 0) + 1);
         if (capped !== corrected[id]) { corrected[id] = capped; changed = true; }
       });
       if (changed) {
@@ -545,6 +591,7 @@ $('username-input').addEventListener('input', () => {
 
 $('refresh-btn').addEventListener('click', refresh);
 
+migrateIfNeeded();
 loadSettings();
 if (getUsername()) { render(); refresh(); }
 </script>
