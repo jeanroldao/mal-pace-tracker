@@ -183,6 +183,7 @@ const LS_CLIENTID  = 'mal_tracker_clientid';
 const LS_SNAP_PFX  = 'mal_snap_';
 const LS_SNAP_TS_PFX = 'mal_snap_ts_';
 const LS_TITLES    = 'mal_titles';
+const LS_TODAY_READING = 'mal_today_reading';
 const DEFAULT_GOAL         = 10;
 const AUTO_REFRESH_MS      = 30 * 60 * 1000; // 30 minutes
 
@@ -327,12 +328,31 @@ function render() {
   const goal   = getGoal();
   const titles = loadTitles();
 
+  // Load today's reading directly from Jikan history (bypasses snapshot-diff caching)
+  let todayHistoryData = null;
+  const todayRaw = localStorage.getItem(LS_TODAY_READING);
+  if (todayRaw) {
+    try {
+      const parsed = JSON.parse(todayRaw);
+      if (parsed.date === dateKey(0)) todayHistoryData = parsed.chapters;
+    } catch (_) {}
+  }
+
   const last7  = [];
   let cumDelta = 0;
   for (let i = 6; i >= 0; i--) {
     const snapCurr = loadSnapshot(dateKey(i));
     const snapPrev = loadSnapshot(dateKey(i + 1));
-    const diff     = computeDiff(snapPrev, snapCurr, titles);
+    let diff       = computeDiff(snapPrev, snapCurr, titles);
+    // For today, always prefer live Jikan history data over snapshot diff
+    if (i === 0 && todayHistoryData && Object.keys(todayHistoryData).length > 0) {
+      const byTitle = {};
+      Object.entries(todayHistoryData).forEach(([id, count]) => {
+        const t = titles[id] || `id:${id}`;
+        byTitle[t] = (byTitle[t] || 0) + count;
+      });
+      diff = { total: Object.values(byTitle).reduce((s, v) => s + v, 0), byTitle };
+    }
     const count    = diff ? diff.total : null;
     if (count !== null) cumDelta += count - goal;
     last7.push({ label: dayLabel(i), isToday: i === 0, count, cumDelta: count !== null ? cumDelta : null, byTitle: diff?.byTitle || {} });
@@ -449,6 +469,9 @@ async function refresh() {
     const { byDay, titles: jikanTitles } = groupHistoryByDay(historyData);
     saveTitles(jikanTitles);
     backfillSnapshots(snap, byDay);
+
+    // Save today's reading directly from Jikan history so render() can use it without snapshot diffs
+    localStorage.setItem(LS_TODAY_READING, JSON.stringify({ date: dateKey(0), chapters: byDay[dateKey(0)] || {} }));
 
     // Option 1: if yesterday's snapshot is still missing but Jikan returned today's
     // increments, derive yesterday's snapshot by subtracting them from today's snapshot.
