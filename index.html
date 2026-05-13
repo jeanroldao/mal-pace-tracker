@@ -344,14 +344,28 @@ function render() {
     const snapCurr = loadSnapshot(dateKey(i));
     const snapPrev = loadSnapshot(dateKey(i + 1));
     let diff       = computeDiff(snapPrev, snapCurr, titles);
-    // For today, always prefer live Jikan history data over snapshot diff
-    if (i === 0 && todayHistoryData && Object.keys(todayHistoryData).length > 0) {
+    // For today, prefer Jikan history but supplement with snapshot diff for manga
+    // not yet propagated to Jikan (e.g. recently updated chapters).
+    if (i === 0 && todayHistoryData !== null) {
+      const byId = { ...todayHistoryData };
+      if (snapCurr && snapPrev) {
+        Object.keys(snapCurr).forEach(id => {
+          if (!(id in byId)) {
+            const d = (snapCurr[id] || 0) - (snapPrev[id] || 0);
+            if (d > 0) byId[id] = d;
+          }
+        });
+      }
       const byTitle = {};
-      Object.entries(todayHistoryData).forEach(([id, count]) => {
-        const t = titles[id] || `id:${id}`;
-        byTitle[t] = (byTitle[t] || 0) + count;
+      Object.entries(byId).forEach(([id, count]) => {
+        if (count > 0) {
+          const t = titles[id] || `id:${id}`;
+          byTitle[t] = (byTitle[t] || 0) + count;
+        }
       });
-      diff = { total: Object.values(byTitle).reduce((s, v) => s + v, 0), byTitle };
+      if (Object.keys(byTitle).length > 0) {
+        diff = { total: Object.values(byTitle).reduce((s, v) => s + v, 0), byTitle };
+      }
     }
     const count    = diff ? diff.total : null;
     if (count !== null) cumDelta += count - goal;
