@@ -275,7 +275,7 @@ async function fetchJikanHistory(username) {
 function groupHistoryByDay(historyData) {
   const byDay = {}, titles = {};
   historyData.forEach(entry => {
-    const day       = entry.date.slice(0, 10); // 'YYYY-MM-DD'
+    const day       = dateToKey(new Date(entry.date)); // local date 'YYYY-MM-DD'
     const mangaId   = String(entry.entry.mal_id);
     const increment = entry.increment || 0;
     if (!byDay[day]) byDay[day] = {};
@@ -473,7 +473,7 @@ async function refresh() {
       const corrected = { ...yesterdaySnap };
       let changed = false;
       historyData.forEach(entry => {
-        if (entry.date.slice(0, 10) !== dateKey(1)) return;
+        if (dateToKey(new Date(entry.date)) !== dateKey(1)) return;
         if (new Date(entry.date).getTime() <= savedAt) return;
         const id = String(entry.entry.mal_id);
         const capped = Math.min(snap[id] || 0, (corrected[id] || 0) + (entry.increment || 0));
