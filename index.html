@@ -195,10 +195,14 @@ const CORS_PFX  = 'https://corsproxy.io/?url=';
 
 const $ = id => document.getElementById(id);
 
+function dateToKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
 function dateKey(daysAgo = 0) {
   const d = new Date();
   d.setDate(d.getDate() - daysAgo);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return dateToKey(d);
 }
 
 function dayLabel(daysAgo) {
@@ -422,11 +426,17 @@ async function refresh() {
   render();
 
   try {
-    // Option 2: if we have a stale today-snapshot but no yesterday snapshot, the stale
-    // snapshot is likely from the previous day — promote it to yesterday before overwriting.
+    // Option 2: if we have a today-snapshot from exactly yesterday but no yesterday
+    // snapshot, promote it before overwriting. Guard with the saved timestamp so that
+    // a snapshot from two or more days ago is NOT promoted — that would cause all
+    // missed-day chapters to be lumped into today's count.
     const prevTodaySnap = loadSnapshot(dateKey(0));
-    if (prevTodaySnap && !loadSnapshot(dateKey(1))) {
-      saveSnapshot(dateKey(1), prevTodaySnap);
+    const prevTodayTsRaw = localStorage.getItem(LS_SNAP_TS_PFX + dateKey(0));
+    if (prevTodaySnap && !loadSnapshot(dateKey(1)) && prevTodayTsRaw) {
+      const savedKey = dateToKey(new Date(parseInt(prevTodayTsRaw, 10)));
+      if (savedKey === dateKey(1)) {
+        saveSnapshot(dateKey(1), prevTodaySnap);
+      }
     }
 
     const data             = await fetchMangaList(username, clientId);
