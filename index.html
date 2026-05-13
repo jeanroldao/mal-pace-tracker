@@ -239,7 +239,7 @@ function saveTitles(t)           { localStorage.setItem(LS_TITLES, JSON.stringif
 
 async function fetchMangaList(username, clientId) {
   let all = [];
-  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status`;
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status&status=reading`;
   while (url) {
     const res = await fetch(CORS_PFX + encodeURIComponent(url), {
       headers: { 'X-MAL-CLIENT-ID': clientId }
@@ -255,12 +255,11 @@ async function fetchMangaList(username, clientId) {
 
 function buildSnapshot(data) {
   const snap = {}, titles = {};
-  // Exclude manga with terminal statuses (completed / dropped) that haven't been
-  // touched within the 8-day tracking window.  These entries never gain new chapters
-  // and, if their stored num_chapters_read ever diverges from an older snapshot
-  // (e.g. the user bulk-corrected chapter counts on MAL), the diff would falsely
-  // credit thousands of chapters to "today".  Manga completed or dropped within the
-  // last 8 days are still included so that the completion-day reading counts.
+  // Only "reading" entries are fetched from the API, so every item here is active.
+  // The completed/dropped guard below is kept as a safety net in case the API ever
+  // returns mixed statuses; entries with terminal statuses that haven't been touched
+  // within the 8-day window are excluded to prevent stale chapter-count divergence
+  // from falsely crediting thousands of chapters to "today".
   const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000;
   data.forEach(item => {
     const status    = item.list_status?.status;
