@@ -275,6 +275,8 @@ async function fetchJikanHistory(username) {
 // Derive everything the renderer needs from the latest API responses.
 //
 //   snapCurr[id]       = MAL's current num_chapters_read for an active manga
+//   updatedToday       = set of manga ids whose list_status.updated_at falls
+//                        on the user's local "today"
 //   byDay[day][id]     = number of Jikan history entries for that manga on
 //                        that day (one entry = one chapter; the increment
 //                        field is the chapter NUMBER, not a delta)
@@ -283,20 +285,23 @@ async function fetchJikanHistory(username) {
 //                        was the user on at the start of today" reference
 //   titles[id]         = display title (from MAL, falls back to Jikan)
 function buildState(mangaList, history) {
-  const todayKey = dateKey(0);
+  const todayKey     = dateKey(0);
+  const todayStartMs = new Date().setHours(0, 0, 0, 0);
   const titles = {}, snapCurr = {}, byDay = {}, maxBeforeToday = {};
+  const updatedToday = new Set();
 
   // Manga with terminal statuses (completed / dropped) older than 8 days
   // can't contribute new reads and just risk noise from chapter-count edits,
   // so filter them out — anything finished within the window still counts.
   const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000;
   mangaList.forEach(item => {
-    const status    = item.list_status?.status;
-    const updatedAt = item.list_status?.updated_at
+    const status      = item.list_status?.status;
+    const updatedAtMs = item.list_status?.updated_at
       ? new Date(item.list_status.updated_at).getTime() : Date.now();
-    if ((status === 'completed' || status === 'dropped') && updatedAt < cutoff) return;
+    if ((status === 'completed' || status === 'dropped') && updatedAtMs < cutoff) return;
     const id = String(item.node.id);
     snapCurr[id] = item.list_status?.num_chapters_read || 0;
+    if (updatedAtMs >= todayStartMs) updatedToday.add(id);
     if (item.node.title) titles[id] = item.node.title;
   });
 
@@ -312,7 +317,7 @@ function buildState(mangaList, history) {
     }
   });
 
-  return { snapCurr, byDay, maxBeforeToday, titles };
+  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles };
 }
 
 function render() {
@@ -324,7 +329,7 @@ function render() {
       : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
-  const { snapCurr, byDay, maxBeforeToday, titles } = buildState(latestMangaList, latestHistory);
+  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles } = buildState(latestMangaList, latestHistory);
 
   const last7 = [];
   let cumDelta = 0;
@@ -333,21 +338,27 @@ function render() {
     let count = null, byTitle = {};
 
     if (i === 0) {
-      // Today: MAL's current num_chapters_read minus the highest chapter
-      // Jikan recorded for that manga strictly before today. This is exact
-      // and uses MAL as the real-time source — no waiting on Jikan to
-      // propagate today's reads. For a manga with NO past Jikan history
-      // (could be a metadata-only edit), fall back to today's Jikan entry
-      // count: that way an actual read still shows up, but a status flip
-      // with a high carried-over chapter count doesn't inflate today.
+      // Today's chapters per manga, in order of preference:
+      //   1. MAL has it AND Jikan has past entries -> snapCurr - maxBeforeToday
+      //      (exact and real-time; doesn't wait on Jikan propagation).
+      //   2. Jikan has at least one entry today for it -> use that count.
+      //   3. MAL says list_status.updated_at is today -> assume 1 chapter.
+      //      This is the "Jikan hasn't propagated yet AND no past entries"
+      //      case (manga the user just started, or whose older entries fell
+      //      out of Jikan's rolling window). Picks up just-read chapters
+      //      immediately; the trade-off is that touching an entry without
+      //      reading (score / status edit) also looks like 1 chapter until
+      //      Jikan's today bucket catches up and corrects.
       count = 0;
       const jikanToday = byDay[dKey] || {};
       Object.keys(snapCurr).forEach(id => {
-        let d;
+        let d = 0;
         if (id in maxBeforeToday) {
           d = (snapCurr[id] || 0) - maxBeforeToday[id];
-        } else {
-          d = jikanToday[id] || 0;
+        } else if (id in jikanToday) {
+          d = jikanToday[id];
+        } else if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
+          d = 1;
         }
         if (d > 0) {
           count += d;
