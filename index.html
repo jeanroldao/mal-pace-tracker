@@ -249,7 +249,9 @@ function getClientId() { return $('clientid-input').value.trim(); }
 
 async function fetchMangaList(username, clientId) {
   let all = [];
-  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status`;
+  // Explicitly request `updated_at` as a list_status sub-field; some MAL
+  // responses omit it when only the parent field is named.
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status{status,num_chapters_read,updated_at}`;
   while (url) {
     const res = await fetch(CORS_PFX + encodeURIComponent(url), {
       headers: { 'X-MAL-CLIENT-ID': clientId }
@@ -351,14 +353,21 @@ function render() {
       //      Jikan's today bucket catches up and corrects.
       count = 0;
       const jikanToday = byDay[dKey] || {};
+      const debug = [];
       Object.keys(snapCurr).forEach(id => {
-        let d = 0;
+        let d = 0, reason = 'no-signal';
         if (id in maxBeforeToday) {
           d = (snapCurr[id] || 0) - maxBeforeToday[id];
+          reason = `past-jikan ${snapCurr[id]}-${maxBeforeToday[id]}=${d}`;
         } else if (id in jikanToday) {
           d = jikanToday[id];
+          reason = `today-jikan ${d}`;
         } else if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
           d = 1;
+          reason = `updated_at fallback`;
+        }
+        if (d !== 0 || reason !== 'no-signal') {
+          debug.push(`${titles[id] || id}: ${reason}`);
         }
         if (d > 0) {
           count += d;
@@ -366,6 +375,8 @@ function render() {
           byTitle[t] = (byTitle[t] || 0) + d;
         }
       });
+      console.log('[pace] today =', count, '| updatedToday size:', updatedToday.size, '| jikanToday keys:', Object.keys(jikanToday).length);
+      console.log('[pace] per-manga (non-zero):', debug);
     } else {
       // Past day: Jikan logs the exact date each chapter was read.
       const jikanDay = byDay[dKey];
