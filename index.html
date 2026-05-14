@@ -370,32 +370,34 @@ function render() {
     let count = null, byTitle = {};
 
     if (i === 0) {
-      // Today: snapshot diff gives the exact chapter delta and catches reads
-      // that haven't propagated to Jikan yet, but it also reflects pure
-      // metadata edits (e.g. user bulk-sets a manga's num_chapters_read or
-      // changes status into "reading") which can falsely credit hundreds of
-      // chapters to today. Use Jikan as an "actually-read" signal: per-manga
-      // diff only counts when there's at least one Jikan history entry for
-      // that manga today. If Jikan has no today data at all, fall back to the
-      // raw snapshot diff so very recent reads aren't lost to propagation lag.
+      // Today: prefer the MAL snapshot diff — it's exact and real-time, no
+      // Jikan propagation lag. Apply Jikan only as a per-manga safety gate
+      // for entries that appear in today's snap but NOT yesterday's (e.g.
+      // the user flipped a manga's status into "reading" with a non-zero
+      // chapter count, which would otherwise be credited as today's reading).
+      // For those, require at least one Jikan history entry today before
+      // counting them.
       const snapCurr   = loadSnapshot(dateKey(0));
       const snapPrev   = loadSnapshot(dateKey(1));
       const jikanToday = jikanByDay[dateKey(0)] || {};
       if (snapCurr && snapPrev) {
-        if (Object.keys(jikanToday).length === 0) {
-          const diff = computeDiff(snapPrev, snapCurr, titles);
-          if (diff) { count = diff.total; byTitle = diff.byTitle; }
-        } else {
-          count = 0;
-          Object.keys(jikanToday).forEach(id => {
-            const d = (snapCurr[id] || 0) - (snapPrev[id] || 0);
-            if (d > 0) {
-              count += d;
-              const t = titles[id] || `id:${id}`;
-              byTitle[t] = (byTitle[t] || 0) + d;
-            }
-          });
-        }
+        count = 0;
+        Object.keys(snapCurr).forEach(id => {
+          let d;
+          if (id in snapPrev) {
+            d = (snapCurr[id] || 0) - (snapPrev[id] || 0);
+          } else {
+            // Newly in today's snap (likely a status flip). Use Jikan's
+            // per-manga entry count so we only credit chapters that have
+            // an actual history entry today.
+            d = jikanToday[id] || 0;
+          }
+          if (d > 0) {
+            count += d;
+            const t = titles[id] || `id:${id}`;
+            byTitle[t] = (byTitle[t] || 0) + d;
+          }
+        });
       } else if (Object.keys(jikanToday).length > 0) {
         // No yesterday snapshot yet (e.g. first refresh after the schema
         // migration). Fall back to Jikan's per-manga entry count so today
