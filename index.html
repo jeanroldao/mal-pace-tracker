@@ -138,6 +138,12 @@
   .status-msg { font-size: 13px; font-family: var(--mono); color: var(--muted); padding: 2rem 0; text-align: center; }
   .error-msg { font-size: 13px; font-family: var(--mono); color: var(--red); background: var(--red-bg); border-radius: 6px; padding: 12px 14px; margin-bottom: 1rem; line-height: 1.6; }
 
+  .build-info {
+    font-size: 10px; font-family: var(--mono); color: var(--muted);
+    text-align: center; margin-top: 2rem; padding-top: 1rem;
+    border-top: 1px solid var(--border); opacity: 0.6;
+  }
+
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
@@ -174,6 +180,7 @@
     <p class="status-msg">enter your MAL username above to start</p>
   </div>
 
+  <footer class="build-info" id="build-info">build __BUILD_ID__</footer>
 </div>
 
 <script>
@@ -353,21 +360,14 @@ function render() {
       //      Jikan's today bucket catches up and corrects.
       count = 0;
       const jikanToday = byDay[dKey] || {};
-      const debug = [];
       Object.keys(snapCurr).forEach(id => {
-        let d = 0, reason = 'no-signal';
+        let d = 0;
         if (id in maxBeforeToday) {
           d = (snapCurr[id] || 0) - maxBeforeToday[id];
-          reason = `past-jikan ${snapCurr[id]}-${maxBeforeToday[id]}=${d}`;
         } else if (id in jikanToday) {
           d = jikanToday[id];
-          reason = `today-jikan ${d}`;
         } else if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
           d = 1;
-          reason = `updated_at fallback`;
-        }
-        if (d !== 0 || reason !== 'no-signal') {
-          debug.push(`${titles[id] || id}: ${reason}`);
         }
         if (d > 0) {
           count += d;
@@ -375,8 +375,6 @@ function render() {
           byTitle[t] = (byTitle[t] || 0) + d;
         }
       });
-      console.log('[pace] today =', count, '| updatedToday size:', updatedToday.size, '| jikanToday keys:', Object.keys(jikanToday).length);
-      console.log('[pace] per-manga (non-zero):', debug);
     } else {
       // Past day: Jikan logs the exact date each chapter was read.
       const jikanDay = byDay[dKey];
@@ -518,6 +516,12 @@ $('username-input').addEventListener('input', () => {
 });
 
 $('refresh-btn').addEventListener('click', refresh);
+
+// Hide the build footer when it still carries the literal placeholder
+// (e.g. file:// previews or the raw repo HTML), so only the deployed
+// site shows a real build ID injected by the GitHub Actions workflow.
+const buildEl = $('build-info');
+if (buildEl && buildEl.textContent.includes('__BUILD_ID__')) buildEl.style.display = 'none';
 
 migrateIfNeeded();
 loadSettings();
