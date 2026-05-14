@@ -396,6 +396,18 @@ function render() {
             }
           });
         }
+      } else if (Object.keys(jikanToday).length > 0) {
+        // No yesterday snapshot yet (e.g. first refresh after the schema
+        // migration). Fall back to Jikan's per-manga entry count so today
+        // isn't blank while the snapshot history rebuilds.
+        count = 0;
+        Object.entries(jikanToday).forEach(([id, ch]) => {
+          if (ch > 0) {
+            count += ch;
+            const t = titles[id] || `id:${id}`;
+            byTitle[t] = (byTitle[t] || 0) + ch;
+          }
+        });
       }
     } else {
       // Past days: use Jikan history directly — it records the exact date each
