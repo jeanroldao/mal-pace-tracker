@@ -197,8 +197,9 @@ let isRefreshing     = false;
 // In-memory cache of the latest API responses, so re-renders triggered by
 // goal changes don't have to refetch. Cleared on page reload by design —
 // every fresh session starts with a fresh API pull.
-let latestMangaList = null;
-let latestHistory   = null;
+let latestMangaList    = null;
+let latestHistory      = null;
+let latestHistoryError = null;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const JIKAN_API = 'https://api.jikan.moe/v4';
@@ -273,12 +274,18 @@ async function fetchMangaList(username, clientId) {
 }
 
 async function fetchJikanHistory(username) {
+  // MAL's official API doesn't expose per-day reading history, so we go
+  // through Jikan (jikan.moe) which scrapes MAL's public history page.
+  // Surface failures instead of swallowing them — when this returns no
+  // data the entire past-7-days panel sits empty.
   try {
     const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga`);
-    if (!res.ok) return [];
+    if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
     const json = await res.json();
-    return json.data || [];
-  } catch (_) { return []; }
+    return { data: json.data || [], error: null };
+  } catch (e) {
+    return { data: [], error: `Jikan request failed: ${e.message || e}` };
+  }
 }
 
 // Derive everything the renderer needs from the latest API responses.
@@ -404,7 +411,13 @@ function render() {
   const todayTitlesSorted = Object.entries(todayEntry.byTitle).sort((a, b) => b[1] - a[1]);
 
   $('main-content').innerHTML = `
-    ${noData > 0 ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — MAL only exposes a rolling history window, so older days outside that window stay blank.</div>` : ''}
+    ${latestHistoryError
+      ? `<div class="error-msg">⚠ couldn't load reading history from Jikan (${latestHistoryError}). MAL's official API doesn't expose per-day history, so the 7-day chart depends on Jikan (jikan.moe). Hit refresh to try again.</div>`
+      : (latestHistory && latestHistory.length === 0
+          ? `<div class="notice">ℹ Jikan returned no reading history for this account. MAL doesn't expose per-day history through its official API, so the 7-day chart relies on Jikan's scrape of your MAL history page. If you've definitely been reading, it might be a temporary Jikan cache miss — hit refresh in a moment.</div>`
+          : (noData > 0
+              ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — Jikan only exposes a rolling history window, so older days outside that window stay blank.</div>`
+              : ''))}
 
     <div class="metrics-grid">
       <div class="metric">
@@ -481,12 +494,13 @@ async function refresh() {
   render();
 
   try {
-    const [mangaList, history] = await Promise.all([
+    const [mangaList, historyResult] = await Promise.all([
       fetchMangaList(username, clientId),
       fetchJikanHistory(username),
     ]);
-    latestMangaList = mangaList;
-    latestHistory   = history;
+    latestMangaList    = mangaList;
+    latestHistory      = historyResult.data;
+    latestHistoryError = historyResult.error;
 
     isRefreshing = false;
     render();
