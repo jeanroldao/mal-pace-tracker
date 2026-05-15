@@ -257,12 +257,14 @@ function getClientId() { return $('clientid-input').value.trim(); }
 
 async function fetchMangaList(username, clientId) {
   let all = [];
-  // Explicitly request `updated_at` as a list_status sub-field; some MAL
-  // responses omit it when only the parent field is named.
-  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status{status,num_chapters_read,updated_at}`;
+  // Explicit `updated_at` sub-field, and a cache-bust query param so the
+  // CORS proxy can't hand us a stale response when the user just bumped
+  // a chapter on MAL seconds ago.
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status{status,num_chapters_read,updated_at}&_=${Date.now()}`;
   while (url) {
     const res = await fetch(CORS_PFX + encodeURIComponent(url), {
-      headers: { 'X-MAL-CLIENT-ID': clientId }
+      headers: { 'X-MAL-CLIENT-ID': clientId },
+      cache: 'no-store',
     });
     if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || b.error || `HTTP ${res.status}`); }
     const json = await res.json();
@@ -279,7 +281,9 @@ async function fetchJikanHistory(username) {
   // Surface failures instead of swallowing them — when this returns no
   // data the entire past-7-days panel sits empty.
   try {
-    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga`);
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga&_=${Date.now()}`, {
+      cache: 'no-store',
+    });
     if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
     const json = await res.json();
     return { data: json.data || [], error: null };
@@ -354,27 +358,29 @@ function render() {
     let count = null, byTitle = {};
 
     if (i === 0) {
-      // Today's chapters per manga, in order of preference:
-      //   1. MAL has it AND Jikan has past entries -> snapCurr - maxBeforeToday
-      //      (exact and real-time; doesn't wait on Jikan propagation).
-      //   2. Jikan has at least one entry today for it -> use that count.
-      //   3. MAL says list_status.updated_at is today -> assume 1 chapter.
-      //      This is the "Jikan hasn't propagated yet AND no past entries"
-      //      case (manga the user just started, or whose older entries fell
-      //      out of Jikan's rolling window). Picks up just-read chapters
-      //      immediately; the trade-off is that touching an entry without
-      //      reading (score / status edit) also looks like 1 chapter until
-      //      Jikan's today bucket catches up and corrects.
+      // Today's chapters per manga = the strongest signal we have:
+      //   1. MAL snapCurr minus Jikan's max chapter before today
+      //      (exact when both sources are up to date).
+      //   2. Number of Jikan entries today for that manga.
+      //   3. updated_at says it was touched today -> at least 1.
+      // We take the MAX across tiers rather than short-circuiting on the
+      // first one: if MAL is stale (CORS-proxy cache, sub-second reads)
+      // or Jikan's window already contains today's read, tier 1 yields 0
+      // even though tier 3 knows the user touched it. Max also keeps
+      // bulk reads (multiple chapters of one manga) correct because
+      // tier 1 still produces the true delta.
       count = 0;
       const jikanToday = byDay[dKey] || {};
       Object.keys(snapCurr).forEach(id => {
         let d = 0;
         if (id in maxBeforeToday) {
-          d = (snapCurr[id] || 0) - maxBeforeToday[id];
-        } else if (id in jikanToday) {
-          d = jikanToday[id];
-        } else if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
-          d = 1;
+          d = Math.max(d, (snapCurr[id] || 0) - maxBeforeToday[id]);
+        }
+        if (id in jikanToday) {
+          d = Math.max(d, jikanToday[id]);
+        }
+        if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
+          d = Math.max(d, 1);
         }
         if (d > 0) {
           count += d;
