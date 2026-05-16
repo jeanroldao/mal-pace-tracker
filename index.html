@@ -169,6 +169,11 @@
         <input id="goal-input" type="number" min="1" max="999" value="10">
         <span>ch/day</span>
       </div>
+      <div class="pill">
+        <label for="offset-input">offset</label>
+        <input id="offset-input" type="number" value="0" step="1">
+        <span>ch</span>
+      </div>
       <button id="refresh-btn">
         <span class="spinner" id="spinner"></span>
         <span id="btn-label">↻ refresh</span>
@@ -186,6 +191,7 @@
 <script>
 const LS_USERNAME       = 'mal_tracker_username';
 const LS_GOAL           = 'mal_tracker_goal';
+const LS_OFFSET         = 'mal_tracker_offset';
 const LS_CLIENTID       = 'mal_tracker_clientid';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
 const SCHEMA_VERSION = '3';
@@ -229,6 +235,7 @@ function dayLabel(daysAgo) {
 function loadSettings() {
   $('username-input').value  = localStorage.getItem(LS_USERNAME) || '';
   $('goal-input').value      = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
+  $('offset-input').value    = localStorage.getItem(LS_OFFSET) || 0;
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
@@ -238,7 +245,7 @@ function loadSettings() {
 // and Jikan history caches.
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
-  const keep = new Set([LS_USERNAME, LS_GOAL, LS_CLIENTID, LS_SCHEMA_VERSION]);
+  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_CLIENTID, LS_SCHEMA_VERSION]);
   Object.keys(localStorage).forEach(k => { if (!keep.has(k)) localStorage.removeItem(k); });
   localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
 }
@@ -247,12 +254,14 @@ function saveSettings() {
   const u = $('username-input').value.trim();
   if (u) localStorage.setItem(LS_USERNAME, u);
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
+  localStorage.setItem(LS_OFFSET, $('offset-input').value || 0);
   const c = $('clientid-input').value.trim();
   if (c) localStorage.setItem(LS_CLIENTID, c);
 }
 
 function getUsername() { return $('username-input').value.trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
+function getOffset()   { const v = parseInt($('offset-input').value, 10); return Number.isFinite(v) ? v : 0; }
 function getClientId() { return $('clientid-input').value.trim(); }
 
 async function fetchMangaList(username, clientId) {
@@ -351,8 +360,12 @@ function render() {
   }
   const { snapCurr, updatedToday, byDay, maxBeforeToday, titles } = buildState(latestMangaList, latestHistory);
 
+  // `offset` carries lifetime deficit/surplus from before the 7-day window so
+  // pace doesn't reset every time a low-chapter day rolls off. It seeds the
+  // cumulative-delta column and flows into the pace metric below.
+  const offset = getOffset();
   const last7 = [];
-  let cumDelta = 0;
+  let cumDelta = offset;
   for (let i = 6; i >= 0; i--) {
     const dKey = dateKey(i);
     let count = null, byTitle = {};
@@ -409,6 +422,7 @@ function render() {
   const known     = last7.filter(d => d.count !== null);
   const weekTotal = known.reduce((s, d) => s + d.count, 0);
   const weekDelta = weekTotal - goal * known.length;
+  const paceDelta = weekDelta + offset;
   const todayEntry = last7[last7.length - 1];
   const dailyAvg  = known.length > 0 ? Math.round((weekTotal / known.length) * 10) / 10 : 0;
   const maxBar    = Math.max(goal * 1.5, ...last7.map(d => d.count ?? 0), 1);
@@ -438,8 +452,8 @@ function render() {
       </div>
       <div class="metric">
         <div class="metric-label">pace</div>
-        <div class="metric-value ${weekDelta >= 0 ? 'ahead' : 'behind'}">${known.length > 0 ? (weekDelta >= 0 ? '+' : '') + weekDelta : '—'}</div>
-        <div class="metric-sub">${known.length > 0 ? (weekDelta >= 0 ? 'ahead' : 'behind') : 'no data yet'}</div>
+        <div class="metric-value ${paceDelta >= 0 ? 'ahead' : 'behind'}">${known.length > 0 ? (paceDelta >= 0 ? '+' : '') + paceDelta : '—'}</div>
+        <div class="metric-sub">${known.length > 0 ? (paceDelta >= 0 ? 'ahead' : 'behind') : 'no data yet'}${offset !== 0 ? ` · offset ${offset >= 0 ? '+' : ''}${offset}` : ''}</div>
       </div>
       <div class="metric">
         <div class="metric-label">avg/day</div>
@@ -525,6 +539,8 @@ async function refresh() {
 }
 
 $('goal-input').addEventListener('input', () => { saveSettings(); render(); });
+
+$('offset-input').addEventListener('input', () => { saveSettings(); render(); });
 
 $('clientid-input').addEventListener('input', () => { saveSettings(); });
 
