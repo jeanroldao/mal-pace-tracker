@@ -138,6 +138,17 @@
   .status-msg { font-size: 13px; font-family: var(--mono); color: var(--muted); padding: 2rem 0; text-align: center; }
   .error-msg { font-size: 13px; font-family: var(--mono); color: var(--red); background: var(--red-bg); border-radius: 6px; padding: 12px 14px; margin-bottom: 1rem; line-height: 1.6; }
 
+  .anchor-info {
+    font-size: 11px; font-family: var(--mono); color: var(--muted);
+    margin: -0.5rem 0 1.25rem 0; text-align: center; line-height: 1.6;
+  }
+  .anchor-info button {
+    background: none; border: none; color: var(--muted);
+    text-decoration: underline; cursor: pointer; padding: 0;
+    font-family: inherit; font-size: inherit;
+  }
+  .anchor-info button:hover { color: var(--text); }
+
   .build-info {
     font-size: 10px; font-family: var(--mono); color: var(--muted);
     text-align: center; margin-top: 2rem; padding-top: 1rem;
@@ -193,6 +204,8 @@ const LS_USERNAME       = 'mal_tracker_username';
 const LS_GOAL           = 'mal_tracker_goal';
 const LS_OFFSET         = 'mal_tracker_offset';
 const LS_CLIENTID       = 'mal_tracker_clientid';
+const LS_ANCHOR_DATE    = 'mal_anchor_date';
+const LS_ANCHOR_TOTAL   = 'mal_anchor_total';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
 const SCHEMA_VERSION = '3';
 const DEFAULT_GOAL = 10;
@@ -245,9 +258,33 @@ function loadSettings() {
 // and Jikan history caches.
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
-  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_CLIENTID, LS_SCHEMA_VERSION]);
+  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_CLIENTID, LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_SCHEMA_VERSION]);
   Object.keys(localStorage).forEach(k => { if (!keep.has(k)) localStorage.removeItem(k); });
   localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
+}
+
+function getAnchor() {
+  const date = localStorage.getItem(LS_ANCHOR_DATE);
+  const totalStr = localStorage.getItem(LS_ANCHOR_TOTAL);
+  if (!date || totalStr === null) return null;
+  const total = parseInt(totalStr, 10);
+  if (!Number.isFinite(total)) return null;
+  return { date, total };
+}
+function setAnchor(date, total) {
+  localStorage.setItem(LS_ANCHOR_DATE, date);
+  localStorage.setItem(LS_ANCHOR_TOTAL, String(total));
+}
+function clearAnchor() {
+  localStorage.removeItem(LS_ANCHOR_DATE);
+  localStorage.removeItem(LS_ANCHOR_TOTAL);
+}
+// Calendar-day difference between two YYYY-MM-DD strings (interpreted as
+// local midnight). Negative if `to` precedes `from`.
+function daysBetween(fromStr, toStr) {
+  const a = new Date(fromStr + 'T00:00:00').getTime();
+  const b = new Date(toStr   + 'T00:00:00').getTime();
+  return Math.round((b - a) / 86400000);
 }
 
 function saveSettings() {
@@ -318,18 +355,23 @@ function buildState(mangaList, history) {
   const todayStartMs = new Date().setHours(0, 0, 0, 0);
   const titles = {}, snapCurr = {}, byDay = {}, maxBeforeToday = {};
   const updatedToday = new Set();
+  // Lifetime total across the whole library (every status). Used as the
+  // anchor baseline so chapter counts don't disappear when a manga later
+  // gets marked completed or dropped.
+  let totalChapters = 0;
 
-  // Manga with terminal statuses (completed / dropped) older than 8 days
-  // can't contribute new reads and just risk noise from chapter-count edits,
-  // so filter them out — anything finished within the window still counts.
+  // For per-day tracking, drop terminal statuses (completed / dropped) older
+  // than 8 days — those can't contribute new reads and risk noise from any
+  // chapter-count edits. Anything finished within the window still counts.
   const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000;
   mangaList.forEach(item => {
-    const status      = item.list_status?.status;
-    const updatedAtMs = item.list_status?.updated_at
-      ? new Date(item.list_status.updated_at).getTime() : Date.now();
+    const ls = item.list_status || {};
+    totalChapters += ls.num_chapters_read || 0;
+    const status      = ls.status;
+    const updatedAtMs = ls.updated_at ? new Date(ls.updated_at).getTime() : Date.now();
     if ((status === 'completed' || status === 'dropped') && updatedAtMs < cutoff) return;
     const id = String(item.node.id);
-    snapCurr[id] = item.list_status?.num_chapters_read || 0;
+    snapCurr[id] = ls.num_chapters_read || 0;
     if (updatedAtMs >= todayStartMs) updatedToday.add(id);
     if (item.node.title) titles[id] = item.node.title;
   });
@@ -346,7 +388,7 @@ function buildState(mangaList, history) {
     }
   });
 
-  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles };
+  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters };
 }
 
 function render() {
@@ -358,14 +400,15 @@ function render() {
       : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
-  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles } = buildState(latestMangaList, latestHistory);
+  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters } = buildState(latestMangaList, latestHistory);
 
-  // `offset` carries lifetime deficit/surplus from before the 7-day window so
-  // pace doesn't reset every time a low-chapter day rolls off. It seeds the
-  // cumulative-delta column and flows into the pace metric below.
+  // First pass: compute each day's count/byTitle. We assign cumDelta in a
+  // second pass once we know whether to anchor the running total to the
+  // lifetime baseline (so the rightmost cumDelta lines up with the pace
+  // metric) or fall back to just the offset.
   const offset = getOffset();
+  const anchor = getAnchor();
   const last7 = [];
-  let cumDelta = offset;
   for (let i = 6; i >= 0; i--) {
     const dKey = dateKey(i);
     let count = null, byTitle = {};
@@ -415,14 +458,36 @@ function render() {
         });
       }
     }
-    if (count !== null) cumDelta += count - goal;
-    last7.push({ label: dayLabel(i), isToday: i === 0, count, cumDelta: count !== null ? cumDelta : null, byTitle });
+    last7.push({ label: dayLabel(i), isToday: i === 0, count, byTitle });
   }
 
   const known     = last7.filter(d => d.count !== null);
   const weekTotal = known.reduce((s, d) => s + d.count, 0);
   const weekDelta = weekTotal - goal * known.length;
-  const paceDelta = weekDelta + offset;
+  // paceDelta is "how many chapters ahead/behind goal you are, total":
+  //   - with an anchor: lifetime, since the anchor was set
+  //   - without:        the last-7-days delta + offset
+  let paceDelta, daysSinceAnchor = null;
+  if (anchor) {
+    daysSinceAnchor = Math.max(0, daysBetween(anchor.date, dateKey(0)));
+    paceDelta = (totalChapters - anchor.total) - goal * daysSinceAnchor + offset;
+  } else {
+    paceDelta = weekDelta + offset;
+  }
+
+  // Second pass: align the cumulative-delta column so its rightmost cell
+  // equals paceDelta. We seed cumDelta with (paceDelta - weekDelta), so
+  // adding each day's (count - goal) lands at paceDelta on the last known
+  // day.
+  let cumDelta = paceDelta - weekDelta;
+  last7.forEach(d => {
+    if (d.count !== null) {
+      cumDelta += d.count - goal;
+      d.cumDelta = cumDelta;
+    } else {
+      d.cumDelta = null;
+    }
+  });
   const todayEntry = last7[last7.length - 1];
   const dailyAvg  = known.length > 0 ? Math.round((weekTotal / known.length) * 10) / 10 : 0;
   const maxBar    = Math.max(goal * 1.5, ...last7.map(d => d.count ?? 0), 1);
@@ -452,8 +517,8 @@ function render() {
       </div>
       <div class="metric">
         <div class="metric-label">pace</div>
-        <div class="metric-value ${paceDelta >= 0 ? 'ahead' : 'behind'}">${known.length > 0 ? (paceDelta >= 0 ? '+' : '') + paceDelta : '—'}</div>
-        <div class="metric-sub">${known.length > 0 ? (paceDelta >= 0 ? 'ahead' : 'behind') : 'no data yet'}${offset !== 0 ? ` · offset ${offset >= 0 ? '+' : ''}${offset}` : ''}</div>
+        <div class="metric-value ${paceDelta >= 0 ? 'ahead' : 'behind'}">${paceDelta >= 0 ? '+' : ''}${paceDelta}</div>
+        <div class="metric-sub">${paceDelta >= 0 ? 'ahead' : 'behind'}${offset !== 0 ? ` · offset ${offset >= 0 ? '+' : ''}${offset}` : ''}</div>
       </div>
       <div class="metric">
         <div class="metric-label">avg/day</div>
@@ -461,6 +526,8 @@ function render() {
         <div class="metric-sub">ch/day</div>
       </div>
     </div>
+
+    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
 
     <div class="section-label" style="margin-bottom:10px">last 7 days — right column = cumulative delta vs goal</div>
     <div class="days-table">
@@ -490,6 +557,15 @@ function render() {
           </div>`).join('')}
       </div>` : ''}
   `;
+
+  const resetBtn = $('reset-anchor-btn');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      const today = dateKey(0);
+      setAnchor(today, totalChapters);
+      render();
+    });
+  }
 }
 
 async function refresh() {
@@ -521,6 +597,13 @@ async function refresh() {
     latestMangaList    = mangaList;
     latestHistory      = historyResult.data;
     latestHistoryError = historyResult.error;
+
+    // First refresh ever (or after a manual reset): anchor today's lifetime
+    // total so pace is measured against this moment going forward.
+    if (!getAnchor()) {
+      const totalChapters = mangaList.reduce((s, item) => s + (item.list_status?.num_chapters_read || 0), 0);
+      setAnchor(dateKey(0), totalChapters);
+    }
 
     isRefreshing = false;
     render();
