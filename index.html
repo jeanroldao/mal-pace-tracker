@@ -350,6 +350,43 @@ async function fetchJikanHistory(username) {
 //                        before today — used as a real-time "what chapter
 //                        was the user on at the start of today" reference
 //   titles[id]         = display title (from MAL, falls back to Jikan)
+// Detect the systematic time-zone shift between Jikan history dates and the
+// real UTC moment a chapter was read. Jikan scrapes MAL's history page,
+// which renders timestamps in the user's MAL profile timezone (commonly
+// JST), but Jikan stamps them as UTC — so a 23:30 BRT read can show up
+// dated as the next local day. MAL's `list_status.updated_at` is a proper
+// ISO-8601 UTC timestamp; diffing it against the latest Jikan entry for the
+// same manga reveals the offset, which we apply to every Jikan date before
+// converting to a local day.
+function detectJikanOffsetMs(mangaList, history) {
+  const latestByManga = {};
+  history.forEach(e => {
+    const id = String(e.entry.mal_id);
+    const t = new Date(e.date).getTime();
+    if (!latestByManga[id] || latestByManga[id] < t) latestByManga[id] = t;
+  });
+
+  const offsets = [];
+  mangaList.forEach(item => {
+    const ls = item.list_status || {};
+    if (!ls.updated_at) return;
+    const id = String(item.node.id);
+    if (latestByManga[id] === undefined) return;
+    const offset = latestByManga[id] - new Date(ls.updated_at).getTime();
+    // Only trust pairs within 48 h of each other — beyond that the MAL
+    // update_at is almost certainly an unrelated event (score change, etc.)
+    // and not the same act as the latest chapter read.
+    if (Math.abs(offset) < 48 * 3600 * 1000) offsets.push(offset);
+  });
+
+  if (offsets.length === 0) return 0;
+  offsets.sort((a, b) => a - b);
+  const median = offsets[Math.floor(offsets.length / 2)];
+  // Snap to the nearest 30 minutes — real timezone offsets are whole or
+  // half hours.
+  return Math.round(median / (30 * 60 * 1000)) * (30 * 60 * 1000);
+}
+
 function buildState(mangaList, history) {
   const todayKey     = dateKey(0);
   const todayStartMs = new Date().setHours(0, 0, 0, 0);
@@ -376,8 +413,12 @@ function buildState(mangaList, history) {
     if (item.node.title) titles[id] = item.node.title;
   });
 
+  const jikanOffsetMs = detectJikanOffsetMs(mangaList, history);
   history.forEach(entry => {
-    const day = dateToKey(new Date(entry.date)); // local date
+    // Shift Jikan's reported moment back to true UTC so the local day
+    // attribution matches what the user actually saw on their clock.
+    const adjustedMs = new Date(entry.date).getTime() - jikanOffsetMs;
+    const day = dateToKey(new Date(adjustedMs)); // user's local date
     const id  = String(entry.entry.mal_id);
     const ch  = entry.increment || 0;
     if (entry.entry.name) titles[id] = titles[id] || entry.entry.name;
@@ -388,7 +429,7 @@ function buildState(mangaList, history) {
     }
   });
 
-  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters };
+  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters, jikanOffsetMs };
 }
 
 function render() {
@@ -400,7 +441,7 @@ function render() {
       : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
-  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters } = buildState(latestMangaList, latestHistory);
+  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters, jikanOffsetMs } = buildState(latestMangaList, latestHistory);
 
   // First pass: compute each day's count/byTitle. We assign cumDelta in a
   // second pass once we know whether to anchor the running total to the
@@ -527,7 +568,7 @@ function render() {
       </div>
     </div>
 
-    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
+    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button>${jikanOffsetMs ? `<br>Jikan tz shift ${jikanOffsetMs >= 0 ? '+' : ''}${(jikanOffsetMs / 3600000).toFixed(1)}h auto-applied` : ''}</div>` : ''}
 
     <div class="section-label" style="margin-bottom:10px">last 7 days — right column = cumulative delta vs goal</div>
     <div class="days-table">
