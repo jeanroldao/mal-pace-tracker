@@ -206,23 +206,21 @@ const LS_OFFSET         = 'mal_tracker_offset';
 const LS_CLIENTID       = 'mal_tracker_clientid';
 const LS_ANCHOR_DATE    = 'mal_anchor_date';
 const LS_ANCHOR_TOTAL   = 'mal_anchor_total';
+const LS_SNAP_PFX       = 'mal_snap_';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
-const SCHEMA_VERSION = '3';
+const SCHEMA_VERSION = '4';
 const DEFAULT_GOAL = 10;
 const AUTO_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
+const SNAP_KEEP_DAYS = 30;
 
 let autoRefreshTimer = null;
 let isRefreshing     = false;
-// In-memory cache of the latest API responses, so re-renders triggered by
-// goal changes don't have to refetch. Cleared on page reload by design —
+// In-memory cache of the latest MAL fetch. Cleared on page reload by design —
 // every fresh session starts with a fresh API pull.
-let latestMangaList    = null;
-let latestHistory      = null;
-let latestHistoryError = null;
+let latestMangaList = null;
 
-const MAL_API   = 'https://api.myanimelist.net/v2';
-const JIKAN_API = 'https://api.jikan.moe/v4';
-const CORS_PFX  = 'https://corsproxy.io/?url=';
+const MAL_API  = 'https://api.myanimelist.net/v2';
+const CORS_PFX = 'https://corsproxy.io/?url=';
 
 const $ = id => document.getElementById(id);
 
@@ -252,15 +250,38 @@ function loadSettings() {
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
-// The app is now stateless apart from user settings — every refresh recomputes
-// the 7-day view from a fresh MAL + Jikan pull. Clean up keys left over from
-// older versions that stored per-day snapshots, snapshot timestamps, titles,
-// and Jikan history caches.
+// Per-day reading is now derived from stored MAL snapshots (no more Jikan
+// roundtrips, which were unreliable — 504s, 30-min caches, JST-as-UTC date
+// shifts). Snapshots keep ~30 days. Migration clears any keys left over from
+// previous schemas — including older snapshot formats — except whitelisted
+// user settings + anchor.
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
   const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_CLIENTID, LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_SCHEMA_VERSION]);
   Object.keys(localStorage).forEach(k => { if (!keep.has(k)) localStorage.removeItem(k); });
   localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
+}
+
+function saveSnapshot(date, data) { localStorage.setItem(LS_SNAP_PFX + date, JSON.stringify(data)); }
+function loadSnapshot(date) {
+  const r = localStorage.getItem(LS_SNAP_PFX + date);
+  if (!r) return null;
+  try { return JSON.parse(r); } catch (_) { return null; }
+}
+function allSnapshots() {
+  return Object.keys(localStorage)
+    .filter(k => k.startsWith(LS_SNAP_PFX))
+    .map(k => ({ date: k.slice(LS_SNAP_PFX.length), snap: loadSnapshot(k.slice(LS_SNAP_PFX.length)) }))
+    .filter(s => s.snap)
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+function pruneOldSnapshots() {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - SNAP_KEEP_DAYS);
+  const cutoffKey = dateToKey(cutoff);
+  Object.keys(localStorage)
+    .filter(k => k.startsWith(LS_SNAP_PFX) && k.slice(LS_SNAP_PFX.length) < cutoffKey)
+    .forEach(k => localStorage.removeItem(k));
 }
 
 function getAnchor() {
@@ -321,183 +342,85 @@ async function fetchMangaList(username, clientId) {
   return all;
 }
 
-async function fetchJikanHistory(username) {
-  // MAL's official API doesn't expose per-day reading history, so we go
-  // through Jikan (jikan.moe) which scrapes MAL's public history page.
-  // Surface failures instead of swallowing them — when this returns no
-  // data the entire past-7-days panel sits empty.
-  try {
-    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga&_=${Date.now()}`, {
-      cache: 'no-store',
-    });
-    if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
-    const json = await res.json();
-    return { data: json.data || [], error: null };
-  } catch (e) {
-    return { data: [], error: `Jikan request failed: ${e.message || e}` };
-  }
-}
-
-// Derive everything the renderer needs from the latest API responses.
-//
-//   snapCurr[id]       = MAL's current num_chapters_read for an active manga
-//   updatedToday       = set of manga ids whose list_status.updated_at falls
-//                        on the user's local "today"
-//   byDay[day][id]     = number of Jikan history entries for that manga on
-//                        that day (one entry = one chapter; the increment
-//                        field is the chapter NUMBER, not a delta)
-//   maxBeforeToday[id] = highest Jikan increment for that manga strictly
-//                        before today — used as a real-time "what chapter
-//                        was the user on at the start of today" reference
-//   titles[id]         = display title (from MAL, falls back to Jikan)
-// Detect the systematic time-zone shift between Jikan history dates and the
-// real UTC moment a chapter was read. Jikan scrapes MAL's history page,
-// which renders timestamps in the user's MAL profile timezone (commonly
-// JST), but Jikan stamps them as UTC — so a 23:30 BRT read can show up
-// dated as the next local day. MAL's `list_status.updated_at` is a proper
-// ISO-8601 UTC timestamp; diffing it against the latest Jikan entry for the
-// same manga reveals the offset, which we apply to every Jikan date before
-// converting to a local day.
-function detectJikanOffsetMs(mangaList, history) {
-  const latestByManga = {};
-  history.forEach(e => {
-    const id = String(e.entry.mal_id);
-    const t = new Date(e.date).getTime();
-    if (!latestByManga[id] || latestByManga[id] < t) latestByManga[id] = t;
-  });
-
-  const offsets = [];
+// Boil a MAL response into the shape we persist + read from. `perManga` and
+// `updatedAt` are keyed by mal_id; `total` is the lifetime sum across the
+// whole library (every status), so the anchor baseline doesn't shrink if a
+// manga later gets marked completed or dropped.
+function buildSnapshot(mangaList) {
+  const perManga = {}, updatedAt = {}, titles = {};
+  let total = 0;
   mangaList.forEach(item => {
     const ls = item.list_status || {};
-    if (!ls.updated_at) return;
     const id = String(item.node.id);
-    if (latestByManga[id] === undefined) return;
-    const offset = latestByManga[id] - new Date(ls.updated_at).getTime();
-    // Only trust pairs within 48 h of each other — beyond that the MAL
-    // update_at is almost certainly an unrelated event (score change, etc.)
-    // and not the same act as the latest chapter read.
-    if (Math.abs(offset) < 48 * 3600 * 1000) offsets.push(offset);
-  });
-
-  if (offsets.length === 0) return 0;
-  offsets.sort((a, b) => a - b);
-  const median = offsets[Math.floor(offsets.length / 2)];
-  // Snap to the nearest 30 minutes — real timezone offsets are whole or
-  // half hours.
-  return Math.round(median / (30 * 60 * 1000)) * (30 * 60 * 1000);
-}
-
-function buildState(mangaList, history) {
-  const todayKey     = dateKey(0);
-  const todayStartMs = new Date().setHours(0, 0, 0, 0);
-  const titles = {}, snapCurr = {}, byDay = {}, maxBeforeToday = {};
-  const updatedToday = new Set();
-  // Lifetime total across the whole library (every status). Used as the
-  // anchor baseline so chapter counts don't disappear when a manga later
-  // gets marked completed or dropped.
-  let totalChapters = 0;
-
-  // For per-day tracking, drop terminal statuses (completed / dropped) older
-  // than 8 days — those can't contribute new reads and risk noise from any
-  // chapter-count edits. Anything finished within the window still counts.
-  const cutoff = Date.now() - 8 * 24 * 60 * 60 * 1000;
-  mangaList.forEach(item => {
-    const ls = item.list_status || {};
-    totalChapters += ls.num_chapters_read || 0;
-    const status      = ls.status;
-    const updatedAtMs = ls.updated_at ? new Date(ls.updated_at).getTime() : Date.now();
-    if ((status === 'completed' || status === 'dropped') && updatedAtMs < cutoff) return;
-    const id = String(item.node.id);
-    snapCurr[id] = ls.num_chapters_read || 0;
-    if (updatedAtMs >= todayStartMs) updatedToday.add(id);
+    const ch = ls.num_chapters_read || 0;
+    perManga[id] = ch;
+    total += ch;
+    if (ls.updated_at) updatedAt[id] = new Date(ls.updated_at).getTime();
     if (item.node.title) titles[id] = item.node.title;
   });
+  return { perManga, updatedAt, total, titles };
+}
 
-  const jikanOffsetMs = detectJikanOffsetMs(mangaList, history);
-  history.forEach(entry => {
-    // Shift Jikan's reported moment back to true UTC so the local day
-    // attribution matches what the user actually saw on their clock.
-    const adjustedMs = new Date(entry.date).getTime() - jikanOffsetMs;
-    const day = dateToKey(new Date(adjustedMs)); // user's local date
-    const id  = String(entry.entry.mal_id);
-    const ch  = entry.increment || 0;
-    if (entry.entry.name) titles[id] = titles[id] || entry.entry.name;
-    if (!byDay[day]) byDay[day] = {};
-    byDay[day][id] = (byDay[day][id] || 0) + 1;
-    if (day < todayKey) {
-      maxBeforeToday[id] = Math.max(maxBeforeToday[id] || 0, ch);
-    }
-  });
-
-  return { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters, jikanOffsetMs };
+// Walk all stored snapshots in chronological order, diff each consecutive
+// pair, and attribute the per-manga chapter increases to a local-calendar
+// day. By default the day is the later snapshot's date, but if MAL's
+// `updated_at` for that manga falls within the snapshot window it wins —
+// that correctly attributes a 23:55 read captured by the next morning's
+// refresh to the previous day (the user's day, not the refresh's day).
+function computeDailyReads(snaps) {
+  const daily = {};
+  for (let i = 1; i < snaps.length; i++) {
+    const prev = snaps[i - 1].snap, curr = snaps[i].snap;
+    const prevDate = snaps[i - 1].date, currDate = snaps[i].date;
+    Object.keys(curr.perManga).forEach(id => {
+      const d = (curr.perManga[id] || 0) - (prev.perManga[id] || 0);
+      if (d <= 0) return;
+      let attribDay = currDate;
+      const ts = curr.updatedAt && curr.updatedAt[id];
+      if (ts) {
+        const tsDay = dateToKey(new Date(ts));
+        if (tsDay >= prevDate && tsDay <= currDate) attribDay = tsDay;
+      }
+      if (!daily[attribDay]) daily[attribDay] = {};
+      daily[attribDay][id] = (daily[attribDay][id] || 0) + d;
+    });
+  }
+  return daily;
 }
 
 function render() {
   const goal = getGoal();
-  if (!latestMangaList || !latestHistory) {
+  if (!latestMangaList) {
     // Nothing fetched yet this session; refresh() will rerender once API calls land.
     $('main-content').innerHTML = isRefreshing
       ? `<p class="status-msg">fetching…</p>`
       : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
-  const { snapCurr, updatedToday, byDay, maxBeforeToday, titles, totalChapters, jikanOffsetMs } = buildState(latestMangaList, latestHistory);
+  const currentSnap   = buildSnapshot(latestMangaList);
+  const titles        = currentSnap.titles;
+  const totalChapters = currentSnap.total;
+  const snaps         = allSnapshots();
+  const daily         = computeDailyReads(snaps);
 
-  // First pass: compute each day's count/byTitle. We assign cumDelta in a
-  // second pass once we know whether to anchor the running total to the
-  // lifetime baseline (so the rightmost cumDelta lines up with the pace
-  // metric) or fall back to just the offset.
+  // First pass: per-day counts/byTitle from the stored daily attributions.
+  // The cumulative-delta column is filled in below once we know paceDelta.
   const offset = getOffset();
   const anchor = getAnchor();
   const last7 = [];
   for (let i = 6; i >= 0; i--) {
     const dKey = dateKey(i);
     let count = null, byTitle = {};
-
-    if (i === 0) {
-      // Today's chapters per manga = the strongest signal we have:
-      //   1. MAL snapCurr minus Jikan's max chapter before today
-      //      (exact when both sources are up to date).
-      //   2. Number of Jikan entries today for that manga.
-      //   3. updated_at says it was touched today -> at least 1.
-      // We take the MAX across tiers rather than short-circuiting on the
-      // first one: if MAL is stale (CORS-proxy cache, sub-second reads)
-      // or Jikan's window already contains today's read, tier 1 yields 0
-      // even though tier 3 knows the user touched it. Max also keeps
-      // bulk reads (multiple chapters of one manga) correct because
-      // tier 1 still produces the true delta.
+    const dayReads = daily[dKey];
+    if (dayReads) {
       count = 0;
-      const jikanToday = byDay[dKey] || {};
-      Object.keys(snapCurr).forEach(id => {
-        let d = 0;
-        if (id in maxBeforeToday) {
-          d = Math.max(d, (snapCurr[id] || 0) - maxBeforeToday[id]);
-        }
-        if (id in jikanToday) {
-          d = Math.max(d, jikanToday[id]);
-        }
-        if (updatedToday.has(id) && (snapCurr[id] || 0) > 0) {
-          d = Math.max(d, 1);
-        }
-        if (d > 0) {
-          count += d;
+      Object.entries(dayReads).forEach(([id, ch]) => {
+        if (ch > 0) {
+          count += ch;
           const t = titles[id] || `id:${id}`;
-          byTitle[t] = (byTitle[t] || 0) + d;
+          byTitle[t] = (byTitle[t] || 0) + ch;
         }
       });
-    } else {
-      // Past day: Jikan logs the exact date each chapter was read.
-      const jikanDay = byDay[dKey];
-      if (jikanDay && Object.keys(jikanDay).length > 0) {
-        count = 0;
-        Object.entries(jikanDay).forEach(([id, ch]) => {
-          if (ch > 0) {
-            count += ch;
-            const t = titles[id] || `id:${id}`;
-            byTitle[t] = (byTitle[t] || 0) + ch;
-          }
-        });
-      }
     }
     last7.push({ label: dayLabel(i), isToday: i === 0, count, byTitle });
   }
@@ -537,13 +460,7 @@ function render() {
   const todayTitlesSorted = Object.entries(todayEntry.byTitle).sort((a, b) => b[1] - a[1]);
 
   $('main-content').innerHTML = `
-    ${latestHistoryError
-      ? `<div class="error-msg">⚠ couldn't load reading history from Jikan (${latestHistoryError}). MAL's official API doesn't expose per-day history, so the 7-day chart depends on Jikan (jikan.moe). Hit refresh to try again.</div>`
-      : (latestHistory && latestHistory.length === 0
-          ? `<div class="notice">ℹ Jikan returned no reading history for this account. MAL doesn't expose per-day history through its official API, so the 7-day chart relies on Jikan's scrape of your MAL history page. If you've definitely been reading, it might be a temporary Jikan cache miss — hit refresh in a moment.</div>`
-          : (noData > 0
-              ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — Jikan only exposes a rolling history window, so older days outside that window stay blank.</div>`
-              : ''))}
+    ${noData > 0 ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — per-day reads come from diffing MAL snapshots saved on each refresh, so days before you started using the app (or days you skipped) show blank. Visit daily to keep the chart accurate.</div>` : ''}
 
     <div class="metrics-grid">
       <div class="metric">
@@ -568,7 +485,7 @@ function render() {
       </div>
     </div>
 
-    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button>${jikanOffsetMs ? `<br>Jikan tz shift ${jikanOffsetMs >= 0 ? '+' : ''}${(jikanOffsetMs / 3600000).toFixed(1)}h auto-applied` : ''}</div>` : ''}
+    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
 
     <div class="section-label" style="margin-bottom:10px">last 7 days — right column = cumulative delta vs goal</div>
     <div class="days-table">
@@ -631,20 +548,20 @@ async function refresh() {
   render();
 
   try {
-    const [mangaList, historyResult] = await Promise.all([
-      fetchMangaList(username, clientId),
-      fetchJikanHistory(username),
-    ]);
-    latestMangaList    = mangaList;
-    latestHistory      = historyResult.data;
-    latestHistoryError = historyResult.error;
+    const mangaList = await fetchMangaList(username, clientId);
+    latestMangaList = mangaList;
+
+    const snap = buildSnapshot(mangaList);
+    saveSnapshot(dateKey(0), {
+      perManga: snap.perManga,
+      updatedAt: snap.updatedAt,
+      total: snap.total,
+    });
+    pruneOldSnapshots();
 
     // First refresh ever (or after a manual reset): anchor today's lifetime
     // total so pace is measured against this moment going forward.
-    if (!getAnchor()) {
-      const totalChapters = mangaList.reduce((s, item) => s + (item.list_status?.num_chapters_read || 0), 0);
-      setAnchor(dateKey(0), totalChapters);
-    }
+    if (!getAnchor()) setAnchor(dateKey(0), snap.total);
 
     isRefreshing = false;
     render();
