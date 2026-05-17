@@ -215,12 +215,15 @@ const SNAP_KEEP_DAYS = 30;
 
 let autoRefreshTimer = null;
 let isRefreshing     = false;
-// In-memory cache of the latest MAL fetch. Cleared on page reload by design —
-// every fresh session starts with a fresh API pull.
-let latestMangaList = null;
+// In-memory cache of the latest MAL fetch + Jikan history. Cleared on page
+// reload by design — every fresh session starts with a fresh API pull.
+let latestMangaList    = null;
+let latestHistory      = null;
+let latestHistoryError = null;
 
-const MAL_API  = 'https://api.myanimelist.net/v2';
-const CORS_PFX = 'https://corsproxy.io/?url=';
+const MAL_API   = 'https://api.myanimelist.net/v2';
+const JIKAN_API = 'https://api.jikan.moe/v4';
+const CORS_PFX  = 'https://corsproxy.io/?url=';
 
 const $ = id => document.getElementById(id);
 
@@ -342,6 +345,64 @@ async function fetchMangaList(username, clientId) {
   return all;
 }
 
+// Jikan scrapes MAL's history page (which MAL's own API doesn't expose),
+// so it's the only way to attribute past-day reads to specific dates. It
+// occasionally fails (504s, empty responses) — when it does we surface
+// the error and lean on the snapshot pipeline for whatever days have
+// snapshot coverage.
+async function fetchJikanHistory(username) {
+  try {
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga&_=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
+    const json = await res.json();
+    return { data: json.data || [], error: null };
+  } catch (e) {
+    return { data: [], error: `Jikan request failed: ${e.message || e}` };
+  }
+}
+
+// Auto-detect the systematic offset between Jikan's history timestamps
+// (effectively wall-clock time of MAL's profile timezone re-labeled as UTC,
+// typically JST = +9 h) and MAL's real-UTC `list_status.updated_at`. Match
+// each manga's latest Jikan entry against MAL's updated_at, take the median
+// of pairs within 48 h, snap to the nearest 30 min.
+function detectJikanOffsetMs(mangaList, history) {
+  const latestByManga = {};
+  history.forEach(e => {
+    const id = String(e.entry.mal_id);
+    const t = new Date(e.date).getTime();
+    if (!latestByManga[id] || latestByManga[id] < t) latestByManga[id] = t;
+  });
+  const offsets = [];
+  mangaList.forEach(item => {
+    const ls = item.list_status || {};
+    if (!ls.updated_at) return;
+    const id = String(item.node.id);
+    if (latestByManga[id] === undefined) return;
+    const offset = latestByManga[id] - new Date(ls.updated_at).getTime();
+    if (Math.abs(offset) < 48 * 3600 * 1000) offsets.push(offset);
+  });
+  if (offsets.length === 0) return 0;
+  offsets.sort((a, b) => a - b);
+  const median = offsets[Math.floor(offsets.length / 2)];
+  return Math.round(median / (30 * 60 * 1000)) * (30 * 60 * 1000);
+}
+
+// Group Jikan history entries by local calendar day after subtracting the
+// detected offset. Each entry = one chapter read.
+function buildJikanByDay(history, jikanOffsetMs) {
+  const byDay = {}, titles = {};
+  history.forEach(entry => {
+    const adjustedMs = new Date(entry.date).getTime() - jikanOffsetMs;
+    const day = dateToKey(new Date(adjustedMs));
+    const id  = String(entry.entry.mal_id);
+    if (entry.entry.name) titles[id] = titles[id] || entry.entry.name;
+    if (!byDay[day]) byDay[day] = {};
+    byDay[day][id] = (byDay[day][id] || 0) + 1;
+  });
+  return { byDay, titles };
+}
+
 // Boil a MAL response into the shape we persist + read from. `perManga` and
 // `updatedAt` are keyed by mal_id; `total` is the lifetime sum across the
 // whole library (every status), so the anchor baseline doesn't shrink if a
@@ -398,44 +459,67 @@ function render() {
     return;
   }
   const currentSnap   = buildSnapshot(latestMangaList);
-  const titles        = currentSnap.titles;
+  const titles        = { ...currentSnap.titles };
   const totalChapters = currentSnap.total;
   const snaps         = allSnapshots();
-  const daily         = computeDailyReads(snaps);
+  const snapDaily     = computeDailyReads(snaps);
+  // Past-day counts come from Jikan (per-event log, covers days you weren't
+  // using the app); today's count uses snapshot diffs (Jikan lags real-time
+  // and can shift dates around midnight). Snapshots fall back as a backup
+  // for past days when Jikan returns nothing.
+  const jikanOffsetMs = latestHistory ? detectJikanOffsetMs(latestMangaList, latestHistory) : 0;
+  const jikanGrouped  = latestHistory ? buildJikanByDay(latestHistory, jikanOffsetMs) : { byDay: {}, titles: {} };
+  Object.assign(titles, jikanGrouped.titles); // pick up titles for completed manga not in current MAL fetch
 
-  // First-refresh fallback for today: with only one snapshot stored there's
-  // no prior to diff against, so today's count would be null forever until
-  // a second snapshot lands. Use MAL's per-manga updated_at as a "touched
-  // today" signal — each such manga counts as 1 chapter, which gets
-  // overwritten by the exact diff once a second snapshot exists.
+  const offset   = getOffset();
+  const anchor   = getAnchor();
   const todayKey = dateKey(0);
-  if (!daily[todayKey] && currentSnap.updatedAt) {
-    const todayStartMs = new Date().setHours(0, 0, 0, 0);
-    const fallback = {};
-    Object.entries(currentSnap.updatedAt).forEach(([id, ts]) => {
-      if (ts >= todayStartMs && (currentSnap.perManga[id] || 0) > 0) fallback[id] = 1;
+  const last7    = [];
+
+  function entriesToCount(entries, into) {
+    let count = 0;
+    Object.entries(entries).forEach(([id, ch]) => {
+      if (ch > 0) {
+        count += ch;
+        const t = titles[id] || `id:${id}`;
+        into[t] = (into[t] || 0) + ch;
+      }
     });
-    if (Object.keys(fallback).length > 0) daily[todayKey] = fallback;
+    return count;
   }
 
-  // First pass: per-day counts/byTitle from the stored daily attributions.
-  // The cumulative-delta column is filled in below once we know paceDelta.
-  const offset = getOffset();
-  const anchor = getAnchor();
-  const last7 = [];
   for (let i = 6; i >= 0; i--) {
     const dKey = dateKey(i);
-    let count = null, byTitle = {};
-    const dayReads = daily[dKey];
-    if (dayReads) {
-      count = 0;
-      Object.entries(dayReads).forEach(([id, ch]) => {
-        if (ch > 0) {
-          count += ch;
-          const t = titles[id] || `id:${id}`;
-          byTitle[t] = (byTitle[t] || 0) + ch;
-        }
-      });
+    let count = null;
+    const byTitle = {};
+    if (i === 0) {
+      // Today: snapshot diff is authoritative (real-time MAL, includes reads
+      // Jikan hasn't propagated yet). Falls back to Jikan's today bucket,
+      // then to the "manga touched today" updated_at heuristic.
+      const snapReads  = snapDaily[dKey];
+      const jikanReads = jikanGrouped.byDay[dKey];
+      if (snapReads) {
+        count = entriesToCount(snapReads, byTitle);
+      } else if (jikanReads) {
+        count = entriesToCount(jikanReads, byTitle);
+      } else if (currentSnap.updatedAt) {
+        const todayStartMs = new Date().setHours(0, 0, 0, 0);
+        const touched = {};
+        Object.entries(currentSnap.updatedAt).forEach(([id, ts]) => {
+          if (ts >= todayStartMs && (currentSnap.perManga[id] || 0) > 0) touched[id] = 1;
+        });
+        if (Object.keys(touched).length > 0) count = entriesToCount(touched, byTitle);
+      }
+    } else {
+      // Past days: Jikan first (it covers days before you started using the
+      // app, unlike snapshots), snapshot diff as a fallback.
+      const jikanReads = jikanGrouped.byDay[dKey];
+      const snapReads  = snapDaily[dKey];
+      if (jikanReads) {
+        count = entriesToCount(jikanReads, byTitle);
+      } else if (snapReads) {
+        count = entriesToCount(snapReads, byTitle);
+      }
     }
     last7.push({ label: dayLabel(i), isToday: i === 0, count, byTitle });
   }
@@ -475,7 +559,11 @@ function render() {
   const todayTitlesSorted = Object.entries(todayEntry.byTitle).sort((a, b) => b[1] - a[1]);
 
   $('main-content').innerHTML = `
-    ${noData > 0 ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — per-day reads come from diffing MAL snapshots saved on each refresh, so days before you started using the app (or days you skipped) show blank. Visit daily to keep the chart accurate.</div>` : ''}
+    ${latestHistoryError
+      ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). MAL's official API doesn't expose per-day history, so past days will fall back to local snapshot diffs (if any). Hit refresh to retry.</div>`
+      : (noData > 0
+          ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's scrape of your MAL history page, today comes from snapshot diffs. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
+          : '')}
 
     <div class="metrics-grid">
       <div class="metric">
@@ -563,8 +651,13 @@ async function refresh() {
   render();
 
   try {
-    const mangaList = await fetchMangaList(username, clientId);
-    latestMangaList = mangaList;
+    const [mangaList, historyResult] = await Promise.all([
+      fetchMangaList(username, clientId),
+      fetchJikanHistory(username),
+    ]);
+    latestMangaList    = mangaList;
+    latestHistory      = historyResult.data;
+    latestHistoryError = historyResult.error;
 
     const snap = buildSnapshot(mangaList);
     saveSnapshot(dateKey(0), {
