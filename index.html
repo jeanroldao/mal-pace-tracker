@@ -403,6 +403,21 @@ function render() {
   const snaps         = allSnapshots();
   const daily         = computeDailyReads(snaps);
 
+  // First-refresh fallback for today: with only one snapshot stored there's
+  // no prior to diff against, so today's count would be null forever until
+  // a second snapshot lands. Use MAL's per-manga updated_at as a "touched
+  // today" signal — each such manga counts as 1 chapter, which gets
+  // overwritten by the exact diff once a second snapshot exists.
+  const todayKey = dateKey(0);
+  if (!daily[todayKey] && currentSnap.updatedAt) {
+    const todayStartMs = new Date().setHours(0, 0, 0, 0);
+    const fallback = {};
+    Object.entries(currentSnap.updatedAt).forEach(([id, ts]) => {
+      if (ts >= todayStartMs && (currentSnap.perManga[id] || 0) > 0) fallback[id] = 1;
+    });
+    if (Object.keys(fallback).length > 0) daily[todayKey] = fallback;
+  }
+
   // First pass: per-day counts/byTitle from the stored daily attributions.
   // The cumulative-delta column is filled in below once we know paceDelta.
   const offset = getOffset();
