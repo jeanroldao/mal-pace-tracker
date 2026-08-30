@@ -185,6 +185,12 @@
         <input id="offset-input" type="number" value="0" step="1">
         <span>ch</span>
       </div>
+      <div class="pill">
+        <label for="proxy-input">proxy</label>
+        <input id="proxy-input" type="text" placeholder="auto" autocomplete="off" spellcheck="false"
+               title="Optional CORS proxy. Use {url} for the percent-encoded target or {raw} for the raw target; a bare prefix gets the encoded target appended. Leave empty to try the built-in list."
+               style="width:150px">
+      </div>
       <button id="refresh-btn">
         <span class="spinner" id="spinner"></span>
         <span id="btn-label">↻ refresh</span>
@@ -203,6 +209,7 @@
 const LS_USERNAME       = 'mal_tracker_username';
 const LS_GOAL           = 'mal_tracker_goal';
 const LS_OFFSET         = 'mal_tracker_offset';
+const LS_PROXY          = 'mal_tracker_proxy';
 const LS_CLIENTID       = 'mal_tracker_clientid';
 const LS_ANCHOR_DATE    = 'mal_anchor_date';
 const LS_ANCHOR_TOTAL   = 'mal_anchor_total';
@@ -223,7 +230,23 @@ let latestHistoryError = null;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const JIKAN_API = 'https://api.jikan.moe/v4';
-const CORS_PFX  = 'https://corsproxy.io/?url=';
+
+// MAL's API sends no CORS headers and needs an X-MAL-CLIENT-ID request
+// header, so browser calls must go through a proxy that forwards custom
+// headers (and answers the preflight they trigger). Free proxies come and
+// go — they add API-key requirements, origin allowlists, or just die — so
+// try several in order instead of depending on any single one.
+//
+// Templates: {url} = percent-encoded target, {raw} = target as-is.
+const CORS_PROXIES = [
+  'https://corsproxy.io/?url={url}',
+  'https://api.cors.lol/?url={url}',
+  'https://cors.eu.org/{raw}',
+  'https://test.cors.workers.dev/?{raw}',
+];
+// Proxy that answered last — reused for the remaining pages of a paginated
+// fetch so we don't re-probe dead proxies on every page.
+let workingProxy = null;
 
 const $ = id => document.getElementById(id);
 
@@ -250,6 +273,7 @@ function loadSettings() {
   $('username-input').value  = localStorage.getItem(LS_USERNAME) || '';
   $('goal-input').value      = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
   $('offset-input').value    = localStorage.getItem(LS_OFFSET) || 0;
+  $('proxy-input').value     = localStorage.getItem(LS_PROXY) || '';
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
@@ -260,7 +284,7 @@ function loadSettings() {
 // user settings + anchor.
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
-  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_CLIENTID, LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_SCHEMA_VERSION]);
+  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_PROXY, LS_CLIENTID, LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_SCHEMA_VERSION]);
   Object.keys(localStorage).forEach(k => { if (!keep.has(k)) localStorage.removeItem(k); });
   localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
 }
@@ -316,6 +340,7 @@ function saveSettings() {
   if (u) localStorage.setItem(LS_USERNAME, u);
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
   localStorage.setItem(LS_OFFSET, $('offset-input').value || 0);
+  localStorage.setItem(LS_PROXY, $('proxy-input').value.trim());
   const c = $('clientid-input').value.trim();
   if (c) localStorage.setItem(LS_CLIENTID, c);
 }
@@ -323,7 +348,72 @@ function saveSettings() {
 function getUsername() { return $('username-input').value.trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
 function getOffset()   { const v = parseInt($('offset-input').value, 10); return Number.isFinite(v) ? v : 0; }
+function getProxy()    { return $('proxy-input').value.trim(); }
 function getClientId() { return $('clientid-input').value.trim(); }
+
+// Hostname of a proxy template, for readable error messages.
+function proxyLabel(template) {
+  try { return new URL(template.replace(/\{(url|raw)\}/, '')).hostname; }
+  catch (_) { return template.slice(0, 40); }
+}
+
+// Expand a proxy template around a target URL. A template with no
+// placeholder is treated as a prefix that takes the encoded target, which
+// is the shape most proxies (and hand-rolled workers) use.
+function buildProxiedUrl(template, target) {
+  if (template.includes('{url}')) return template.replace('{url}', encodeURIComponent(target));
+  if (template.includes('{raw}')) return template.replace('{raw}', target);
+  return template + encodeURIComponent(target);
+}
+
+// Proxy list to try, in order: the user's own proxy first (if set), then
+// the built-in ones.
+function proxyCandidates() {
+  const custom = getProxy();
+  return custom ? [custom, ...CORS_PROXIES] : [...CORS_PROXIES];
+}
+
+// Fetch `target` through the first proxy that works, remembering it for
+// subsequent calls this session.
+//
+// A non-ok response is ambiguous: it can be the proxy refusing us, or MAL
+// genuinely answering (bad client id -> 401, rate limit -> 429). MAL always
+// answers with a JSON body carrying `error`/`message`, so treat a parseable
+// JSON error as the real thing and stop — retrying other proxies would just
+// hide a 401 behind a wall of proxy noise. Anything else counts as a broken
+// proxy, and we move on.
+async function fetchViaProxy(target, options) {
+  const ordered = workingProxy
+    ? [workingProxy, ...proxyCandidates().filter(p => p !== workingProxy)]
+    : proxyCandidates();
+  const failures = [];
+
+  for (const template of ordered) {
+    let res;
+    try {
+      res = await fetch(buildProxiedUrl(template, target), options);
+    } catch (e) {
+      // TypeError: network error, DNS failure, or a blocked CORS preflight.
+      failures.push(`${proxyLabel(template)}: ${e.message || 'network error'}`);
+      continue;
+    }
+    if (res.ok) { workingProxy = template; return res; }
+
+    const body = await res.json().catch(() => null);
+    if (body && (body.error || body.message)) {
+      workingProxy = template;
+      throw new Error(body.message || body.error);
+    }
+    failures.push(`${proxyLabel(template)}: HTTP ${res.status}`);
+  }
+
+  workingProxy = null;
+  throw new Error(
+    `every CORS proxy failed — ${failures.join(' · ')}. ` +
+    `MAL's API can't be called directly from a browser, so the app needs a proxy. ` +
+    `Paste a working one into the "proxy" field above (see the README for a 15-line Cloudflare Worker you can host yourself).`
+  );
+}
 
 async function fetchMangaList(username, clientId) {
   let all = [];
@@ -332,11 +422,10 @@ async function fetchMangaList(username, clientId) {
   // a chapter on MAL seconds ago.
   let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status{status,num_chapters_read,updated_at}&_=${Date.now()}`;
   while (url) {
-    const res = await fetch(CORS_PFX + encodeURIComponent(url), {
+    const res = await fetchViaProxy(url, {
       headers: { 'X-MAL-CLIENT-ID': clientId },
       cache: 'no-store',
     });
-    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || b.error || `HTTP ${res.status}`); }
     const json = await res.json();
     all.push(...(json.data || []));
     url = json.paging?.next || null;
@@ -690,6 +779,9 @@ async function refresh() {
 $('goal-input').addEventListener('input', () => { saveSettings(); render(); });
 
 $('offset-input').addEventListener('input', () => { saveSettings(); render(); });
+
+// A new proxy invalidates whichever one we'd settled on this session.
+$('proxy-input').addEventListener('input', () => { saveSettings(); workingProxy = null; });
 
 $('clientid-input').addEventListener('input', () => { saveSettings(); });
 
