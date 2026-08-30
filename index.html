@@ -216,11 +216,19 @@ const LS_CLIENTID       = 'mal_tracker_clientid';
 const LS_ANCHOR_DATE    = 'mal_anchor_date';
 const LS_ANCHOR_TOTAL   = 'mal_anchor_total';
 const LS_SNAP_PFX       = 'mal_snap_';
+const LS_TITLES         = 'mal_titles';
+const LS_LAST_OK        = 'mal_last_ok';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
 const SCHEMA_VERSION = '4';
 const DEFAULT_GOAL = 10;
 const AUTO_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const SNAP_KEEP_DAYS = 30;
+// When a refresh can't reach anything, retry on a backoff instead of going
+// dormant — an upstream 504 usually clears on its own, and the app should
+// come back without the user having to notice and hit refresh.
+const RETRY_BASE_MS = 30 * 1000;
+const RETRY_MAX_MS  = 10 * 60 * 1000;
+let retryDelayMs = RETRY_BASE_MS;
 
 let autoRefreshTimer = null;
 let isRefreshing     = false;
@@ -231,6 +239,9 @@ let latestMalError     = null;
 let latestHistory      = null;
 let latestHistoryError = null;
 let latestTotal        = null;
+// Set when a refresh reached nothing at all. The view keeps rendering from
+// stored snapshots; this only drives the "couldn't refresh" banner.
+let latestFetchError   = null;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const JIKAN_API = 'https://api.jikan.moe/v4';
@@ -264,6 +275,20 @@ function dateKey(daysAgo = 0) {
   return dateToKey(d);
 }
 
+// "3 minutes ago" / "2 hours ago" / "yesterday" — for showing how stale a
+// fallback render is. Returns '' for a missing/invalid timestamp.
+function relativeTime(ms) {
+  if (!Number.isFinite(ms)) return '';
+  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (secs < 90) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? 'yesterday' : `${days} days ago`;
+}
+
 function dayLabel(daysAgo) {
   if (daysAgo === 0) return 'today';
   const d = new Date();
@@ -281,16 +306,28 @@ function loadSettings() {
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
-// Per-day reading is now derived from stored MAL snapshots (no more Jikan
-// roundtrips, which were unreliable — 504s, 30-min caches, JST-as-UTC date
-// shifts). Snapshots keep ~30 days. Migration clears any keys left over from
-// previous schemas — including older snapshot formats — except whitelisted
-// user settings + anchor.
+// Drops keys left over from older schemas. Snapshots are deliberately kept:
+// they're the raw local record of what was read (and the only thing that
+// renders when the APIs are down), not a derived cache that a schema bump
+// should invalidate.
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
-  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_PROXY, LS_CLIENTID, LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_SCHEMA_VERSION]);
-  Object.keys(localStorage).forEach(k => { if (!keep.has(k)) localStorage.removeItem(k); });
+  const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_PROXY, LS_CLIENTID,
+                        LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_TITLES, LS_LAST_OK, LS_SCHEMA_VERSION]);
+  Object.keys(localStorage).forEach(k => {
+    if (!keep.has(k) && !k.startsWith(LS_SNAP_PFX)) localStorage.removeItem(k);
+  });
   localStorage.setItem(LS_SCHEMA_VERSION, SCHEMA_VERSION);
+}
+
+// Titles are cached across refreshes so a render with no live data still
+// shows real names instead of "id:12345". Snapshots hold ids only.
+function loadTitles() {
+  try { return JSON.parse(localStorage.getItem(LS_TITLES)) || {}; } catch (_) { return {}; }
+}
+function saveTitles(titles) {
+  if (!titles || Object.keys(titles).length === 0) return;
+  localStorage.setItem(LS_TITLES, JSON.stringify({ ...loadTitles(), ...titles }));
 }
 
 function saveSnapshot(date, data) { localStorage.setItem(LS_SNAP_PFX + date, JSON.stringify(data)); }
@@ -562,22 +599,33 @@ function computeDailyReads(snaps) {
 }
 
 function render() {
-  const goal = getGoal();
-  if (!latestMangaList && !latestHistory && latestTotal === null) {
-    // Nothing fetched yet this session; refresh() will rerender once API calls land.
+  const goal  = getGoal();
+  const snaps = allSnapshots();
+  const haveLive = latestMangaList || latestHistory || latestTotal !== null;
+  if (!haveLive && snaps.length === 0) {
+    // Nothing fetched yet and nothing stored to fall back on.
     $('main-content').innerHTML = isRefreshing
       ? `<p class="status-msg">fetching…</p>`
-      : `<p class="status-msg">hit refresh to load your reading data</p>`;
+      : latestFetchError
+        ? `<div class="error-msg">⚠ couldn't reach Jikan — ${latestFetchError}<br>Nothing is stored locally yet, so there's nothing to show. Retrying automatically.</div>`
+        : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
   // MAL's per-manga detail is optional — when it's unavailable (no client
   // id, or no working CORS proxy) Jikan alone covers history and the
-  // lifetime chapter total, which is everything the metrics need.
-  const currentSnap   = latestMangaList ? buildSnapshot(latestMangaList)
-                                        : { perManga: {}, updatedAt: {}, total: latestTotal, titles: {} };
-  const titles        = { ...currentSnap.titles };
+  // lifetime chapter total. When *neither* is reachable, fall back to the
+  // newest stored snapshot so the view still shows real numbers.
+  const lastStored    = snaps.length ? snaps[snaps.length - 1].snap : null;
+  const currentSnap   = latestMangaList
+    ? buildSnapshot(latestMangaList)
+    : {
+        perManga:  lastStored ? lastStored.perManga  : {},
+        updatedAt: lastStored ? lastStored.updatedAt : {},
+        total:     latestTotal !== null ? latestTotal : (lastStored ? lastStored.total : null),
+        titles:    {},
+      };
+  const titles        = { ...loadTitles(), ...currentSnap.titles };
   const totalChapters = currentSnap.total;
-  const snaps         = allSnapshots();
   const snapDaily     = computeDailyReads(snaps);
   // Past-day counts come from Jikan (per-event log, covers days you weren't
   // using the app); today's count prefers snapshot diffs when MAL data is
@@ -674,13 +722,16 @@ function render() {
   const noData    = last7.filter(d => d.count === null).length;
 
   const todayTitlesSorted = Object.entries(todayEntry.byTitle).sort((a, b) => b[1] - a[1]);
+  const lastOkLabel = relativeTime(parseInt(localStorage.getItem(LS_LAST_OK), 10));
 
   $('main-content').innerHTML = `
-    ${latestHistoryError
-      ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). Past days will fall back to local snapshot diffs (if any). Hit refresh to retry.</div>`
-      : (noData > 0
-          ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
-          : '')}
+    ${latestFetchError
+      ? `<div class="error-msg">⚠ couldn't refresh — ${latestFetchError}<br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.</div>`
+      : (latestHistoryError
+          ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
+          : (noData > 0
+              ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
+              : ''))}
     ${latestMalError
       ? `<div class="notice">ℹ running on Jikan only — MAL's own API is unreachable (${latestMalError.slice(0, 90)}${latestMalError.length > 90 ? '…' : ''}). Everything still works; today's count just refreshes on Jikan's schedule rather than instantly. Clear the client id to hide this, or set a working proxy.</div>`
       : ''}
@@ -781,9 +832,10 @@ async function refresh() {
     latestHistoryError = historyResult.error;
     latestTotal        = totalResult.total;
 
-    if (historyResult.error && totalResult.error && !malResult.data) {
-      throw new Error(`${historyResult.error}. Nothing could be loaded — MAL and Jikan are both unreachable right now.`);
-    }
+    // Nothing came back at all. Don't throw — the view can still render from
+    // stored snapshots, which is far more useful than a blank error page.
+    const gotNothing = !malResult.data && historyResult.error && totalResult.error;
+    latestFetchError = gotNothing ? historyResult.error : null;
 
     const snap = latestMangaList ? buildSnapshot(latestMangaList) : null;
     const total = snap ? snap.total : latestTotal;
@@ -799,20 +851,54 @@ async function refresh() {
       if (!getAnchor()) setAnchor(dateKey(0), total);
     }
 
+    // Remember titles from whichever source answered, so an offline render
+    // still names the manga.
+    if (snap) saveTitles(snap.titles);
+    if (latestHistory) {
+      const fromHistory = {};
+      latestHistory.forEach(e => {
+        if (e?.entry?.name) fromHistory[String(e.entry.mal_id)] = e.entry.name;
+      });
+      saveTitles(fromHistory);
+    }
+
+    if (!gotNothing) localStorage.setItem(LS_LAST_OK, String(Date.now()));
+
     isRefreshing = false;
     render();
-    $('last-updated').textContent = `@${username} · updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+    $('last-updated').textContent = gotNothing
+      ? `@${username} · offline, retrying`
+      : `@${username} · updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
 
-    // Auto-refresh every 30 minutes to keep today's data current.
-    clearTimeout(autoRefreshTimer);
-    autoRefreshTimer = setTimeout(() => refresh(), AUTO_REFRESH_MS);
+    scheduleNextRefresh(gotNothing);
   } catch(e) {
+    // Unexpected failure (a bug, or a source throwing outside its own error
+    // handling). Keep whatever is on screen if we've rendered before.
     isRefreshing = false;
-    $('main-content').innerHTML = `<div class="error-msg">⚠ ${e.message}</div>`;
-    $('last-updated').textContent = `@${username} · error`;
+    latestFetchError = e.message;
+    render();
+    $('last-updated').textContent = `@${username} · error, retrying`;
+    scheduleNextRefresh(true);
   } finally {
     btn.disabled = false; spinner.classList.remove('active'); label.textContent = '↻ refresh';
   }
+}
+
+// Success -> back to the lazy 30-minute cadence. Failure -> retry sooner,
+// backing off up to RETRY_MAX_MS so a long outage doesn't hammer anyone.
+// Either way something is always scheduled: the app must never go dormant
+// on an error and require a manual refresh to come back.
+function scheduleNextRefresh(failed) {
+  clearTimeout(autoRefreshTimer);
+  let delay;
+  if (failed) {
+    delay = retryDelayMs;
+    retryDelayMs = Math.min(retryDelayMs * 2, RETRY_MAX_MS);
+  } else {
+    retryDelayMs = RETRY_BASE_MS;
+    delay = AUTO_REFRESH_MS;
+  }
+  autoRefreshTimer = setTimeout(() => refresh(), delay);
 }
 
 $('goal-input').addEventListener('input', () => { saveSettings(); render(); });
