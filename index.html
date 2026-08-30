@@ -169,7 +169,9 @@
     <div class="header-right">
       <div class="pill">
         <label for="clientid-input">client id</label>
-        <input id="clientid-input" type="text" placeholder="MAL client id" autocomplete="off" spellcheck="false" style="width:130px">
+        <input id="clientid-input" type="text" placeholder="optional" autocomplete="off" spellcheck="false"
+               title="Optional. Only used to add real-time precision to today's count, and it needs a working CORS proxy. Everything else comes from Jikan, which needs no key."
+               style="width:130px">
       </div>
       <div class="pill">
         <label for="username-input">@</label>
@@ -225,8 +227,10 @@ let isRefreshing     = false;
 // In-memory cache of the latest MAL fetch + Jikan history. Cleared on page
 // reload by design — every fresh session starts with a fresh API pull.
 let latestMangaList    = null;
+let latestMalError     = null;
 let latestHistory      = null;
 let latestHistoryError = null;
+let latestTotal        = null;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const JIKAN_API = 'https://api.jikan.moe/v4';
@@ -440,13 +444,32 @@ async function fetchMangaList(username, clientId) {
 // the error and lean on the snapshot pipeline for whatever days have
 // snapshot coverage.
 async function fetchJikanHistory(username) {
+  // The type is a PATH segment in Jikan's routing (`/history[/{type}]`) — as
+  // a query param it was ignored and anime updates came back mixed in.
   try {
-    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history?type=manga&_=${Date.now()}`, { cache: 'no-store' });
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history/manga?_=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
     const json = await res.json();
     return { data: json.data || [], error: null };
   } catch (e) {
     return { data: [], error: `Jikan request failed: ${e.message || e}` };
+  }
+}
+
+// Lifetime chapter count straight from Jikan — no auth, no proxy. This is
+// what the anchor/pace math needs, and it's why the app no longer depends
+// on MAL's own API being reachable.
+async function fetchJikanTotal(username) {
+  try {
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/statistics?_=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return { total: null, error: `Jikan HTTP ${res.status}` };
+    const json = await res.json();
+    const manga = json.data?.manga ?? json.manga;
+    const total = manga?.chapters_read;
+    if (typeof total !== 'number') return { total: null, error: 'Jikan returned no chapter total' };
+    return { total, error: null };
+  } catch (e) {
+    return { total: null, error: `Jikan request failed: ${e.message || e}` };
   }
 }
 
@@ -540,23 +563,27 @@ function computeDailyReads(snaps) {
 
 function render() {
   const goal = getGoal();
-  if (!latestMangaList) {
+  if (!latestMangaList && !latestHistory && latestTotal === null) {
     // Nothing fetched yet this session; refresh() will rerender once API calls land.
     $('main-content').innerHTML = isRefreshing
       ? `<p class="status-msg">fetching…</p>`
       : `<p class="status-msg">hit refresh to load your reading data</p>`;
     return;
   }
-  const currentSnap   = buildSnapshot(latestMangaList);
+  // MAL's per-manga detail is optional — when it's unavailable (no client
+  // id, or no working CORS proxy) Jikan alone covers history and the
+  // lifetime chapter total, which is everything the metrics need.
+  const currentSnap   = latestMangaList ? buildSnapshot(latestMangaList)
+                                        : { perManga: {}, updatedAt: {}, total: latestTotal, titles: {} };
   const titles        = { ...currentSnap.titles };
   const totalChapters = currentSnap.total;
   const snaps         = allSnapshots();
   const snapDaily     = computeDailyReads(snaps);
   // Past-day counts come from Jikan (per-event log, covers days you weren't
-  // using the app); today's count uses snapshot diffs (Jikan lags real-time
-  // and can shift dates around midnight). Snapshots fall back as a backup
+  // using the app); today's count prefers snapshot diffs when MAL data is
+  // present (real-time, no propagation lag). Snapshots fall back as a backup
   // for past days when Jikan returns nothing.
-  const jikanOffsetMs = latestHistory ? detectJikanOffsetMs(latestMangaList, latestHistory) : 0;
+  const jikanOffsetMs = (latestHistory && latestMangaList) ? detectJikanOffsetMs(latestMangaList, latestHistory) : 0;
   const jikanGrouped  = latestHistory ? buildJikanByDay(latestHistory, jikanOffsetMs) : { byDay: {}, titles: {} };
   Object.assign(titles, jikanGrouped.titles); // pick up titles for completed manga not in current MAL fetch
 
@@ -619,8 +646,9 @@ function render() {
   // paceDelta is "how many chapters ahead/behind goal you are, total":
   //   - with an anchor: lifetime, since the anchor was set
   //   - without:        the last-7-days delta + offset
+  const haveTotal = typeof totalChapters === 'number';
   let paceDelta, daysSinceAnchor = null;
-  if (anchor) {
+  if (anchor && haveTotal) {
     daysSinceAnchor = Math.max(0, daysBetween(anchor.date, dateKey(0)));
     paceDelta = (totalChapters - anchor.total) - goal * daysSinceAnchor + offset;
   } else {
@@ -649,10 +677,13 @@ function render() {
 
   $('main-content').innerHTML = `
     ${latestHistoryError
-      ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). MAL's official API doesn't expose per-day history, so past days will fall back to local snapshot diffs (if any). Hit refresh to retry.</div>`
+      ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). Past days will fall back to local snapshot diffs (if any). Hit refresh to retry.</div>`
       : (noData > 0
-          ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's scrape of your MAL history page, today comes from snapshot diffs. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
+          ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
           : '')}
+    ${latestMalError
+      ? `<div class="notice">ℹ running on Jikan only — MAL's own API is unreachable (${latestMalError.slice(0, 90)}${latestMalError.length > 90 ? '…' : ''}). Everything still works; today's count just refreshes on Jikan's schedule rather than instantly. Clear the client id to hide this, or set a working proxy.</div>`
+      : ''}
 
     <div class="metrics-grid">
       <div class="metric">
@@ -677,7 +708,7 @@ function render() {
       </div>
     </div>
 
-    ${anchor ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
+    ${anchor && haveTotal ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
 
     <div class="section-label" style="margin-bottom:10px">last 7 days — right column = cumulative delta vs goal</div>
     <div class="days-table">
@@ -722,16 +753,10 @@ async function refresh() {
   const username = getUsername();
   const clientId = getClientId();
   if (!username) { $('main-content').innerHTML = `<p class="status-msg">enter your MAL username above to start</p>`; return; }
-  if (!clientId) {
-    $('main-content').innerHTML = `<div class="error-msg">⚠ MAL client ID required — <a href="https://myanimelist.net/apiconfig" target="_blank" style="color:inherit">register a free app at myanimelist.net/apiconfig</a> to get one, then paste it in the <strong>client id</strong> field above.</div>`;
-    $('last-updated').textContent = `@${username} · no client id`;
-    return;
-  }
-  if (!/^[a-f0-9]{32}$/i.test(clientId)) {
-    $('main-content').innerHTML = `<div class="error-msg">⚠ Invalid MAL client ID — it should be a 32-character alphanumeric string from <a href="https://myanimelist.net/apiconfig" target="_blank" style="color:inherit">myanimelist.net/apiconfig</a>.</div>`;
-    $('last-updated').textContent = `@${username} · invalid client id`;
-    return;
-  }
+  // A client ID is optional now: Jikan covers history and the lifetime
+  // chapter total without auth. MAL's own API only adds per-manga precision
+  // for today, and it needs both a valid key and a working CORS proxy.
+  const useMal = /^[a-f0-9]{32}$/i.test(clientId);
 
   const btn = $('refresh-btn'), spinner = $('spinner'), label = $('btn-label');
   btn.disabled = true; spinner.classList.add('active'); label.textContent = 'loading…';
@@ -740,25 +765,39 @@ async function refresh() {
   render();
 
   try {
-    const [mangaList, historyResult] = await Promise.all([
-      fetchMangaList(username, clientId),
+    // MAL is best-effort: if the proxy layer is down we still have a fully
+    // working app, so a failure here must not take the refresh with it.
+    const [malResult, historyResult, totalResult] = await Promise.all([
+      useMal
+        ? fetchMangaList(username, clientId).then(d => ({ data: d, error: null }),
+                                                  e => ({ data: null, error: e.message }))
+        : Promise.resolve({ data: null, error: null }),
       fetchJikanHistory(username),
+      fetchJikanTotal(username),
     ]);
-    latestMangaList    = mangaList;
+    latestMangaList    = malResult.data;
+    latestMalError     = malResult.error;
     latestHistory      = historyResult.data;
     latestHistoryError = historyResult.error;
+    latestTotal        = totalResult.total;
 
-    const snap = buildSnapshot(mangaList);
-    saveSnapshot(dateKey(0), {
-      perManga: snap.perManga,
-      updatedAt: snap.updatedAt,
-      total: snap.total,
-    });
-    pruneOldSnapshots();
+    if (historyResult.error && totalResult.error && !malResult.data) {
+      throw new Error(`${historyResult.error}. Nothing could be loaded — MAL and Jikan are both unreachable right now.`);
+    }
 
-    // First refresh ever (or after a manual reset): anchor today's lifetime
-    // total so pace is measured against this moment going forward.
-    if (!getAnchor()) setAnchor(dateKey(0), snap.total);
+    const snap = latestMangaList ? buildSnapshot(latestMangaList) : null;
+    const total = snap ? snap.total : latestTotal;
+    if (total !== null && total !== undefined) {
+      saveSnapshot(dateKey(0), {
+        perManga: snap ? snap.perManga : {},
+        updatedAt: snap ? snap.updatedAt : {},
+        total,
+      });
+      pruneOldSnapshots();
+      // First refresh ever (or after a manual reset): anchor today's lifetime
+      // total so pace is measured against this moment going forward.
+      if (!getAnchor()) setAnchor(dateKey(0), total);
+    }
 
     isRefreshing = false;
     render();

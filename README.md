@@ -6,7 +6,7 @@ A single-page web app for tracking your manga reading pace against a daily chapt
 
 ## What it does
 
-The tracker fetches your MAL "currently reading" list each time you hit **refresh**, saves a snapshot of your chapter counts in `localStorage`, and computes the difference between each day's snapshot to figure out how many chapters you read that day. It then compares that against your daily goal and shows:
+On each **refresh** the tracker reads your public MAL reading history, and compares it against your daily goal to show:
 
 - **Today** — chapters read today vs your goal
 - **N-day total** — cumulative chapters over the days with data
@@ -17,21 +17,36 @@ The tracker fetches your MAL "currently reading" list each time you hit **refres
 
 ## Setup & usage
 
-1. **Get a MAL client ID** — register a free application at [myanimelist.net/apiconfig](https://myanimelist.net/apiconfig). Any name and redirect URL will do; copy the **Client ID** that is generated.
-2. Open the [live site](https://jeanroldao.github.io/mal-pace-tracker/) (or your own deployment).
-3. Paste your **Client ID** and **MAL username** into the fields at the top, and set your daily chapter **goal**.
-4. Click **↻ refresh** — your settings are saved in `localStorage` so you only need to enter them once.
-5. Come back each day and hit refresh to keep the history accurate. The tracker builds up its day-by-day picture from the snapshots it has collected, so the more consistently you visit, the more complete the data will be.
+1. Open the [live site](https://jeanroldao.github.io/mal-pace-tracker/) (or your own deployment).
+2. Type your **MAL username** and set your daily chapter **goal**. That's the whole setup.
+3. Click **↻ refresh** — your settings are saved in `localStorage` so you only need to enter them once.
 
-> **Note:** All data (snapshots, titles, settings) is stored locally in your browser. Nothing is sent to any server other than the MAL API (via a CORS proxy, see below) and Jikan.
+### Where the data comes from
 
-## The CORS proxy
+Everything the app needs comes from [Jikan](https://jikan.moe), an open API that reads public MyAnimeList profiles. It needs no key and sends CORS headers, so the browser can call it directly:
 
-MAL's API sends no CORS headers and requires an `X-MAL-CLIENT-ID` request header, so a browser can't call it directly — the request has to go through a proxy that forwards custom headers and answers the CORS preflight they trigger.
+| What | Endpoint |
+| --- | --- |
+| Chapters read per day (the 7-day chart) | `/users/{username}/history/manga` |
+| Lifetime chapter total (pace + anchor) | `/users/{username}/statistics` → `manga.chapters_read` |
 
-The app ships with a list of public proxies and tries them in order, so one going down no longer takes the app with it. If a request genuinely fails, the error names every proxy it tried and why.
+Because it reads your **public** profile, your MAL list must be public for this to work.
 
-Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
+### Optional: a MAL client ID
+
+MAL's own API is the only source of *per-manga, up-to-the-second* chapter counts, so supplying a **Client ID** from [myanimelist.net/apiconfig](https://myanimelist.net/apiconfig) makes today's number update the instant you log a chapter, instead of waiting for Jikan's cache to roll over.
+
+It is strictly an enhancement. It also requires a working CORS proxy (see below) — if either the key or the proxy is missing, the app says so once and carries on with Jikan.
+
+> **Note:** All state (snapshots, settings, anchor) lives in your browser's `localStorage`. The only requests made are to Jikan, plus — if you supply a client ID — MAL via a CORS proxy.
+
+## The CORS proxy (only for the optional MAL client ID)
+
+MAL's API sends no CORS headers and requires an `X-MAL-CLIENT-ID` request header, so a browser can't call it directly — the request has to go through a proxy that forwards custom headers *and* answers the CORS preflight that a custom header triggers. Plenty of public proxies relay a plain GET but ignore `OPTIONS`, which fails as an unhelpful `Failed to fetch`.
+
+None of this affects Jikan, which sends its own CORS headers — so **the app works with no proxy at all**. This section only matters if you want the real-time precision a client ID adds.
+
+The app tries a list of public proxies in order, and names each one and its failure reason if they all fall over. Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
 
 1. Sign in at [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **Create Worker**.
 2. Replace the worker code with:
