@@ -23,14 +23,16 @@ On each **refresh** the tracker reads your public MAL reading history, and compa
 
 ### Where the data comes from
 
-The app reads from several sources and uses whichever answers, so no single outage takes it down. In rough order of preference:
+The app reads from several sources and uses whichever answers, so no single outage takes it down.
 
 | Source | Gives | Needs |
 | --- | --- | --- |
-| `myanimelist.net/mangalist/{user}/load.json` | per-manga chapter counts (the endpoint MAL's own list page uses) | a proxy, but **no key and no headers** |
+| **`myanimelist.net/mangalist/{user}/load.json`** | per-manga chapter counts — the endpoint MAL's own list page uses | a proxy, but **no key and no headers** |
 | MAL official API | the same, plus per-manga `updated_at` | a client ID **and** a header-forwarding proxy |
 | Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
 | Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
+
+The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
 Day-by-day numbers come from Jikan when it's up. When it isn't, they're reconstructed by diffing the daily snapshots the app stores locally on each refresh — which is why visiting daily keeps the chart complete.
 

@@ -789,7 +789,7 @@ function render() {
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
     ${latestMalError && latestMangaList
-      ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong>. The official API didn't answer (${latestMalError.slice(0, 110)}${latestMalError.length > 110 ? '…' : ''}), which only costs the near-midnight day-attribution refinement.</div>`
+      ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong> — ${latestMalError.slice(0, 130)}${latestMalError.length > 130 ? '…' : ''}</div>`
       : ''}
 
     <div class="metrics-grid">
@@ -856,33 +856,40 @@ function render() {
   }
 }
 
-// Per-manga chapter counts, in order of preference:
-//   1. official API — the only source with per-manga updated_at, but needs
-//      a client id AND a proxy that forwards headers through a preflight
-//   2. public list JSON — no key, no headers, works through simple proxies
-// Returns which one answered so the UI can say so.
+// Per-manga chapter counts. Two sources:
+//
+//   public list — no key, no headers, so no CORS preflight and the wide
+//   pool of simple proxies can serve it. Fast and by far the likeliest to
+//   answer, so it leads by default.
+//
+//   official API — the only source carrying per-manga updated_at (which
+//   buys near-midnight day attribution), but it needs a client id AND a
+//   proxy that survives a preflight. Leading with it costs a full round of
+//   proxy timeouts on every refresh when that isn't set up, so it only goes
+//   first when the user has configured their own proxy — the case where
+//   it's actually likely to work.
+//
+// Returns which source answered so the UI can name it.
 async function fetchMalData(username, clientId, useMal) {
   const errors = [];
-  if (useMal) {
+  const asError = () => (errors.length ? errors.join(' · ') : null);
+  const officialFirst = useMal && !!getProxy();
+
+  for (const kind of (officialFirst ? ['official', 'public'] : ['public', 'official'])) {
+    if (kind === 'official' && !useMal) continue;
     try {
-      return { data: await fetchMangaList(username, clientId), error: null, source: 'MAL API' };
+      if (kind === 'official') {
+        return { data: await fetchMangaList(username, clientId), error: asError(), source: 'MAL API' };
+      }
+      const rows = await fetchMalListPublic(username);
+      return { data: publicRowsToItems(rows), error: asError(), source: 'MAL public list' };
     } catch (e) {
-      errors.push(`official API: ${e.message}`);
+      // Keep going, but remember why — if a later source succeeds the UI
+      // still explains which one it landed on.
+      errors.push(`${kind === 'official' ? 'official API' : 'public list'}: ${e.message}`);
     }
   }
-  try {
-    const rows = await fetchMalListPublic(username);
-    // Keep any earlier failure even though this succeeded — the UI explains
-    // which source it fell back to and why.
-    return {
-      data: publicRowsToItems(rows),
-      error: errors.length ? errors.join(' · ') : null,
-      source: 'MAL public list',
-    };
-  } catch (e) {
-    errors.push(`public list: ${e.message}`);
-  }
-  return { data: null, error: errors.join(' · '), source: null };
+  return { data: null, error: asError(), source: null };
 }
 
 async function refresh() {
