@@ -23,14 +23,18 @@ On each **refresh** the tracker reads your public MAL reading history, and compa
 
 ### Where the data comes from
 
-Everything the app needs comes from [Jikan](https://jikan.moe), an open API that reads public MyAnimeList profiles. It needs no key and sends CORS headers, so the browser can call it directly:
+The app reads from several sources and uses whichever answers, so no single outage takes it down. In rough order of preference:
 
-| What | Endpoint |
-| --- | --- |
-| Chapters read per day (the 7-day chart) | `/users/{username}/history/manga` |
-| Lifetime chapter total (pace + anchor) | `/users/{username}/statistics` → `manga.chapters_read` |
+| Source | Gives | Needs |
+| --- | --- | --- |
+| `myanimelist.net/mangalist/{user}/load.json` | per-manga chapter counts (the endpoint MAL's own list page uses) | a proxy, but **no key and no headers** |
+| MAL official API | the same, plus per-manga `updated_at` | a client ID **and** a header-forwarding proxy |
+| Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
+| Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
 
-Because it reads your **public** profile, your MAL list must be public for this to work.
+Day-by-day numbers come from Jikan when it's up. When it isn't, they're reconstructed by diffing the daily snapshots the app stores locally on each refresh — which is why visiting daily keeps the chart complete.
+
+Your MAL list must be **public**, since every one of these reads your public profile.
 
 ### Optional: a MAL client ID
 
@@ -42,11 +46,14 @@ It is strictly an enhancement. It also requires a working CORS proxy (see below)
 
 ## The CORS proxy (only for the optional MAL client ID)
 
-MAL's API sends no CORS headers and requires an `X-MAL-CLIENT-ID` request header, so a browser can't call it directly — the request has to go through a proxy that forwards custom headers *and* answers the CORS preflight that a custom header triggers. Plenty of public proxies relay a plain GET but ignore `OPTIONS`, which fails as an unhelpful `Failed to fetch`.
+Nothing on `myanimelist.net` sends CORS headers, so a browser can't read it without a relay. There are two tiers, and the difference matters:
 
-None of this affects Jikan, which sends its own CORS headers — so **the app works with no proxy at all**. This section only matters if you want the real-time precision a client ID adds.
+- **Plain GETs** (the public list JSON) need only a pass-through proxy. Most public proxies handle this, so the app keeps two lists and uses the wider one here.
+- **The official API** additionally requires an `X-MAL-CLIENT-ID` header, and any custom header makes the browser send a CORS **preflight** first. Many proxies relay a GET but ignore `OPTIONS`, which surfaces as an unhelpful `Failed to fetch` — this is exactly why every proxy appeared to fail at once.
 
-The app tries a list of public proxies in order, and names each one and its failure reason if they all fall over. Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
+Jikan needs no proxy at all, since it sends its own CORS headers.
+
+The app tries its proxies in order and names each one and its failure reason if they all fall over. Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
 
 1. Sign in at [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **Create Worker**.
 2. Replace the worker code with:

@@ -236,6 +236,7 @@ let isRefreshing     = false;
 // reload by design — every fresh session starts with a fresh API pull.
 let latestMangaList    = null;
 let latestMalError     = null;
+let latestMalSource    = null;
 let latestHistory      = null;
 let latestHistoryError = null;
 let latestTotal        = null;
@@ -244,6 +245,7 @@ let latestTotal        = null;
 let latestFetchError   = null;
 
 const MAL_API   = 'https://api.myanimelist.net/v2';
+const MAL_SITE  = 'https://myanimelist.net';
 const JIKAN_API = 'https://api.jikan.moe/v4';
 
 // MAL's API sends no CORS headers and needs an X-MAL-CLIENT-ID request
@@ -253,15 +255,33 @@ const JIKAN_API = 'https://api.jikan.moe/v4';
 // try several in order instead of depending on any single one.
 //
 // Templates: {url} = percent-encoded target, {raw} = target as-is.
-const CORS_PROXIES = [
+//
+// Two lists, because the two MAL endpoints have different requirements:
+//
+//   HEADER_PROXIES — for the official API, which needs X-MAL-CLIENT-ID
+//   forwarded and the CORS preflight that header triggers answered. Few
+//   proxies do both, which is why they all failed.
+//
+//   SIMPLE_PROXIES — for MAL's public list JSON, which needs no headers at
+//   all. A plain GET needs no preflight, so the much larger pool of
+//   pass-through proxies works here.
+const HEADER_PROXIES = [
   'https://corsproxy.io/?url={url}',
   'https://api.cors.lol/?url={url}',
   'https://cors.eu.org/{raw}',
   'https://test.cors.workers.dev/?{raw}',
 ];
-// Proxy that answered last — reused for the remaining pages of a paginated
-// fetch so we don't re-probe dead proxies on every page.
-let workingProxy = null;
+const SIMPLE_PROXIES = [
+  'https://api.allorigins.win/raw?url={url}',
+  'https://api.codetabs.com/v1/proxy?quest={url}',
+  'https://corsproxy.io/?url={url}',
+  'https://api.cors.lol/?url={url}',
+  'https://cors.eu.org/{raw}',
+  'https://test.cors.workers.dev/?{raw}',
+];
+// Proxy that answered last, per list — reused for the remaining pages of a
+// paginated fetch so we don't re-probe dead proxies on every page.
+const workingProxy = { header: null, simple: null };
 
 const $ = id => document.getElementById(id);
 
@@ -408,10 +428,11 @@ function buildProxiedUrl(template, target) {
 }
 
 // Proxy list to try, in order: the user's own proxy first (if set), then
-// the built-in ones.
-function proxyCandidates() {
+// the built-in ones for this request kind.
+function proxyCandidates(kind) {
+  const list = kind === 'simple' ? SIMPLE_PROXIES : HEADER_PROXIES;
   const custom = getProxy();
-  return custom ? [custom, ...CORS_PROXIES] : [...CORS_PROXIES];
+  return custom ? [custom, ...list] : [...list];
 }
 
 // Fetch `target` through the first proxy that works, remembering it for
@@ -423,10 +444,11 @@ function proxyCandidates() {
 // JSON error as the real thing and stop — retrying other proxies would just
 // hide a 401 behind a wall of proxy noise. Anything else counts as a broken
 // proxy, and we move on.
-async function fetchViaProxy(target, options) {
-  const ordered = workingProxy
-    ? [workingProxy, ...proxyCandidates().filter(p => p !== workingProxy)]
-    : proxyCandidates();
+async function fetchViaProxy(target, options, kind = 'header') {
+  const remembered = workingProxy[kind];
+  const ordered = remembered
+    ? [remembered, ...proxyCandidates(kind).filter(p => p !== remembered)]
+    : proxyCandidates(kind);
   const failures = [];
 
   for (const template of ordered) {
@@ -438,22 +460,56 @@ async function fetchViaProxy(target, options) {
       failures.push(`${proxyLabel(template)}: ${e.message || 'network error'}`);
       continue;
     }
-    if (res.ok) { workingProxy = template; return res; }
+    if (res.ok) { workingProxy[kind] = template; return res; }
 
     const body = await res.json().catch(() => null);
-    if (body && (body.error || body.message)) {
-      workingProxy = template;
+    if (body && !Array.isArray(body) && (body.error || body.message)) {
+      workingProxy[kind] = template;
       throw new Error(body.message || body.error);
     }
     failures.push(`${proxyLabel(template)}: HTTP ${res.status}`);
   }
 
-  workingProxy = null;
+  workingProxy[kind] = null;
   throw new Error(
-    `every CORS proxy failed — ${failures.join(' · ')}. ` +
-    `MAL's API can't be called directly from a browser, so the app needs a proxy. ` +
-    `Paste a working one into the "proxy" field above (see the README for a 15-line Cloudflare Worker you can host yourself).`
+    `every proxy failed — ${failures.join(' · ')}. ` +
+    `MAL sends no CORS headers, so the browser can't call it without one. ` +
+    `Paste a working proxy into the "proxy" field above (see the README for a 15-line Cloudflare Worker you can host yourself).`
   );
+}
+
+// MAL's own website loads your list from this endpoint. It's public JSON,
+// needs no client id and no request headers — so it works through simple
+// pass-through proxies, and it keeps working when Jikan is down. Verified
+// against Jikan's UserMangaListRequest: 300 rows per page, `status=7` for
+// "all statuses".
+async function fetchMalListPublic(username) {
+  const all = [];
+  for (let offset = 0; offset < 10000; offset += 300) {
+    const url = `${MAL_SITE}/mangalist/${encodeURIComponent(username)}/load.json?status=7&offset=${offset}&_=${Date.now()}`;
+    const res  = await fetchViaProxy(url, { cache: 'no-store' }, 'simple');
+    const rows = await res.json();
+    if (!Array.isArray(rows)) {
+      throw new Error('MAL returned an unexpected body — is the list set to public?');
+    }
+    all.push(...rows);
+    if (rows.length < 300) break;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return all;
+}
+
+// Reshape public-list rows into the same structure the official API returns,
+// so snapshots, totals and titles all flow through unchanged. There's no
+// updated_at here — that only costs us the near-midnight day-attribution
+// refinement, and buildSnapshot leaves `updatedAt` empty rather than
+// guessing, which keeps the "touched today" heuristic from firing on
+// everything at once.
+function publicRowsToItems(rows) {
+  return rows.map(r => ({
+    node: { id: r.manga_id, title: r.manga_title },
+    list_status: { num_chapters_read: r.num_read_chapters || 0 },
+  }));
 }
 
 async function fetchMangaList(username, clientId) {
@@ -732,8 +788,8 @@ function render() {
           : (noData > 0
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
-    ${latestMalError
-      ? `<div class="notice">ℹ running on Jikan only — MAL's own API is unreachable (${latestMalError.slice(0, 90)}${latestMalError.length > 90 ? '…' : ''}). Everything still works; today's count just refreshes on Jikan's schedule rather than instantly. Clear the client id to hide this, or set a working proxy.</div>`
+    ${latestMalError && latestMangaList
+      ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong>. The official API didn't answer (${latestMalError.slice(0, 110)}${latestMalError.length > 110 ? '…' : ''}), which only costs the near-midnight day-attribution refinement.</div>`
       : ''}
 
     <div class="metrics-grid">
@@ -800,6 +856,35 @@ function render() {
   }
 }
 
+// Per-manga chapter counts, in order of preference:
+//   1. official API — the only source with per-manga updated_at, but needs
+//      a client id AND a proxy that forwards headers through a preflight
+//   2. public list JSON — no key, no headers, works through simple proxies
+// Returns which one answered so the UI can say so.
+async function fetchMalData(username, clientId, useMal) {
+  const errors = [];
+  if (useMal) {
+    try {
+      return { data: await fetchMangaList(username, clientId), error: null, source: 'MAL API' };
+    } catch (e) {
+      errors.push(`official API: ${e.message}`);
+    }
+  }
+  try {
+    const rows = await fetchMalListPublic(username);
+    // Keep any earlier failure even though this succeeded — the UI explains
+    // which source it fell back to and why.
+    return {
+      data: publicRowsToItems(rows),
+      error: errors.length ? errors.join(' · ') : null,
+      source: 'MAL public list',
+    };
+  } catch (e) {
+    errors.push(`public list: ${e.message}`);
+  }
+  return { data: null, error: errors.join(' · '), source: null };
+}
+
 async function refresh() {
   const username = getUsername();
   const clientId = getClientId();
@@ -816,18 +901,16 @@ async function refresh() {
   render();
 
   try {
-    // MAL is best-effort: if the proxy layer is down we still have a fully
-    // working app, so a failure here must not take the refresh with it.
+    // Every source is best-effort: none of them individually failing should
+    // take the refresh down with it.
     const [malResult, historyResult, totalResult] = await Promise.all([
-      useMal
-        ? fetchMangaList(username, clientId).then(d => ({ data: d, error: null }),
-                                                  e => ({ data: null, error: e.message }))
-        : Promise.resolve({ data: null, error: null }),
+      fetchMalData(username, clientId, useMal),
       fetchJikanHistory(username),
       fetchJikanTotal(username),
     ]);
     latestMangaList    = malResult.data;
     latestMalError     = malResult.error;
+    latestMalSource    = malResult.source;
     latestHistory      = historyResult.data;
     latestHistoryError = historyResult.error;
     latestTotal        = totalResult.total;
