@@ -733,6 +733,13 @@ function computeDailyReads(snaps) {
     const prev = snaps[i - 1].snap, curr = snaps[i].snap;
     const prevDate = snaps[i - 1].date, currDate = snaps[i].date;
     Object.keys(curr.perManga).forEach(id => {
+      // No baseline, no delta. A manga absent from the previous snapshot is
+      // one we're seeing for the first time — freshly added to the list, or
+      // simply not returned by whichever source produced that snapshot. Its
+      // chapter count is history, not today's reading, and treating the
+      // missing value as 0 credited the whole series to a single day.
+      // It gets a baseline now and counts normally from here on.
+      if (!(id in prev.perManga)) return;
       const d = (curr.perManga[id] || 0) - (prev.perManga[id] || 0);
       if (d <= 0) return;
       let attribDay = currDate;
