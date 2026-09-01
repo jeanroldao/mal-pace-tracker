@@ -273,19 +273,22 @@ const EDGE_API  = 'https://jikan.lucashdo.com/v1';
 //   SIMPLE_PROXIES — for MAL's public list JSON, which needs no headers at
 //   all. A plain GET needs no preflight, so the much larger pool of
 //   pass-through proxies works here.
+// corsproxy.io is last in both lists: it now requires its own API key and
+// answers "A valid API key is required" to anonymous callers, so it is only
+// worth trying once everything free has failed.
 const HEADER_PROXIES = [
-  'https://corsproxy.io/?url={url}',
   'https://api.cors.lol/?url={url}',
   'https://cors.eu.org/{raw}',
   'https://test.cors.workers.dev/?{raw}',
+  'https://corsproxy.io/?url={url}',
 ];
 const SIMPLE_PROXIES = [
   'https://api.allorigins.win/raw?url={url}',
   'https://api.codetabs.com/v1/proxy?quest={url}',
-  'https://corsproxy.io/?url={url}',
   'https://api.cors.lol/?url={url}',
   'https://cors.eu.org/{raw}',
   'https://test.cors.workers.dev/?{raw}',
+  'https://corsproxy.io/?url={url}',
 ];
 // Proxy that answered last, per list — reused for the remaining pages of a
 // paginated fetch so we don't re-probe dead proxies on every page.
@@ -447,17 +450,23 @@ function proxyCandidates(kind) {
 // subsequent calls this session.
 //
 // A non-ok response is ambiguous: it can be the proxy refusing us, or MAL
-// genuinely answering (bad client id -> 401, rate limit -> 429). MAL always
-// answers with a JSON body carrying `error`/`message`, so treat a parseable
-// JSON error as the real thing and stop — retrying other proxies would just
-// hide a 401 behind a wall of proxy noise. Anything else counts as a broken
-// proxy, and we move on.
+// genuinely answering (bad client id -> 401, rate limit -> 429). Both arrive
+// as JSON with `message`/`error`, so the body alone can't tell them apart —
+// treating any JSON error as MAL's answer made corsproxy.io's own "a valid
+// API key is required" abort the whole chain before the free proxies were
+// ever tried.
+//
+// So: never stop early. Try every proxy, and decide afterwards. If several
+// independent proxies relayed the *same* error, that's the target speaking
+// and it gets surfaced directly; otherwise each proxy failed its own way and
+// the caller gets the full list.
 async function fetchViaProxy(target, options, kind = 'header') {
   const remembered = workingProxy[kind];
   const ordered = remembered
     ? [remembered, ...proxyCandidates(kind).filter(p => p !== remembered)]
     : proxyCandidates(kind);
   const failures = [];
+  const relayed = [];
 
   for (const template of ordered) {
     let res;
@@ -471,14 +480,18 @@ async function fetchViaProxy(target, options, kind = 'header') {
     if (res.ok) { workingProxy[kind] = template; return res; }
 
     const body = await res.json().catch(() => null);
-    if (body && !Array.isArray(body) && (body.error || body.message)) {
-      workingProxy[kind] = template;
-      throw new Error(body.message || body.error);
-    }
-    failures.push(`${proxyLabel(template)}: HTTP ${res.status}`);
+    const msg = body && !Array.isArray(body) && (body.message || body.error);
+    if (msg) relayed.push(String(msg));
+    failures.push(`${proxyLabel(template)}: ${msg ? String(msg) : 'HTTP ' + res.status}`);
   }
 
   workingProxy[kind] = null;
+
+  const seen = {};
+  for (const m of relayed) seen[m] = (seen[m] || 0) + 1;
+  const agreed = Object.keys(seen).find(m => seen[m] >= 2);
+  if (agreed) throw new Error(agreed);
+
   throw new Error(
     `every proxy failed — ${failures.join(' · ')}. ` +
     `MAL sends no CORS headers, so the browser can't call it without one. ` +
@@ -517,10 +530,18 @@ async function fetchMalListPublic(username) {
 // meta.pagination.hasNextPage, limit max 300.
 async function fetchEdgeMangaList(username) {
   const all = [];
-  for (let page = 1; page <= 20; page++) {
-    const url = `${EDGE_API}/users/${encodeURIComponent(username)}/mangalist?page=${page}&limit=300&_=${Date.now()}`;
+  for (let page = 1; page <= 30; page++) {
+    // Exactly the documented parameters, nothing else: this API validates
+    // its query string, and the `_=<timestamp>` cache-buster we add for MAL
+    // and Jikan came back as HTTP 400 here. `cache: 'no-store'` covers
+    // freshness without inventing a parameter it doesn't know.
+    const url = `${EDGE_API}/users/${encodeURIComponent(username)}/mangalist?page=${page}&limit=100`;
     const res = await fetch(url, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null);
+      const msg = detail && detail.error && (detail.error.message || detail.error.code);
+      throw new Error(msg ? `HTTP ${res.status} — ${msg}` : `HTTP ${res.status}`);
+    }
     const json = await res.json();
     if (!Array.isArray(json && json.data)) {
       throw new Error((json && json.error && json.error.message) || 'unexpected body');
@@ -625,7 +646,9 @@ async function fetchJikanTotal(username) {
   const failures = [];
   for (const src of TOTAL_SOURCES) {
     try {
-      const res = await fetch(`${src.url(user)}?_=${Date.now()}`, { cache: 'no-store' });
+      // No cache-buster param — jikan-edge validates its query string and
+      // rejects unknown keys with a 400.
+      const res = await fetch(src.url(user), { cache: 'no-store' });
       if (!res.ok) { failures.push(`${src.name} HTTP ${res.status}`); continue; }
       const total = readChapterTotal(await res.json());
       if (total === null) { failures.push(`${src.name} returned no chapter total`); continue; }
