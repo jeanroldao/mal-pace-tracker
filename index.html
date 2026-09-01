@@ -247,6 +247,14 @@ let latestFetchError   = null;
 const MAL_API   = 'https://api.myanimelist.net/v2';
 const MAL_SITE  = 'https://myanimelist.net';
 const JIKAN_API = 'https://api.jikan.moe/v4';
+// jikan-edge: an independent reimplementation reading the same public MAL
+// HTML, suggested on jikan-rest#612 during the Aug 2026 outage. It sends
+// Access-Control-Allow-Origin:*, so like Jikan it needs no proxy and no key.
+// Deliberately only used for the chapter total: it cannot serve
+// /users/{user}/history (documented under "Routes we can't serve"), which is
+// the route our 7-day chart wanted. Its envelope is { data, meta } and its
+// fields are camelCase, so responses are read tolerantly below.
+const EDGE_API  = 'https://jikan.lucashdo.com/v1';
 
 // MAL's API sends no CORS headers and needs an X-MAL-CLIENT-ID request
 // header, so browser calls must go through a proxy that forwards custom
@@ -549,21 +557,44 @@ async function fetchJikanHistory(username) {
   }
 }
 
-// Lifetime chapter count straight from Jikan — no auth, no proxy. This is
-// what the anchor/pace math needs, and it's why the app no longer depends
-// on MAL's own API being reachable.
-async function fetchJikanTotal(username) {
-  try {
-    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/statistics?_=${Date.now()}`, { cache: 'no-store' });
-    if (!res.ok) return { total: null, error: `Jikan HTTP ${res.status}` };
-    const json = await res.json();
-    const manga = json.data?.manga ?? json.manga;
-    const total = manga?.chapters_read;
-    if (typeof total !== 'number') return { total: null, error: 'Jikan returned no chapter total' };
-    return { total, error: null };
-  } catch (e) {
-    return { total: null, error: `Jikan request failed: ${e.message || e}` };
+// Pull the lifetime chapter count out of a statistics response without
+// caring which API produced it: Jikan v4 answers { data: { manga: {
+// chapters_read } } }, jikan-edge answers the same shape in camelCase. Only
+// a real number counts — a missing field must not silently become 0 and
+// wreck the anchor.
+function readChapterTotal(json) {
+  for (const root of [json && json.data, json]) {
+    const manga = root && (root.manga || (root.statistics && root.statistics.manga));
+    if (!manga) continue;
+    for (const key of ['chapters_read', 'chaptersRead']) {
+      if (typeof manga[key] === 'number') return manga[key];
+    }
   }
+  return null;
+}
+
+// Lifetime chapter count — no auth, no proxy, either source. Tried in order
+// so an outage at one doesn't cost us the anchor/pace math.
+const TOTAL_SOURCES = [
+  { name: 'Jikan',      url: u => `${JIKAN_API}/users/${u}/statistics` },
+  { name: 'jikan-edge', url: u => `${EDGE_API}/users/${u}/statistics` },
+];
+
+async function fetchJikanTotal(username) {
+  const user = encodeURIComponent(username);
+  const failures = [];
+  for (const src of TOTAL_SOURCES) {
+    try {
+      const res = await fetch(`${src.url(user)}?_=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) { failures.push(`${src.name} HTTP ${res.status}`); continue; }
+      const total = readChapterTotal(await res.json());
+      if (total === null) { failures.push(`${src.name} returned no chapter total`); continue; }
+      return { total, error: null, source: src.name };
+    } catch (e) {
+      failures.push(`${src.name}: ${e.message || e}`);
+    }
+  }
+  return { total: null, error: failures.join(' · '), source: null };
 }
 
 // Auto-detect the systematic offset between Jikan's history timestamps

@@ -31,10 +31,13 @@ The app reads from several sources and uses whichever answers, so no single outa
 | MAL official API | the same, plus per-manga `updated_at` | a client ID **and** a header-forwarding proxy |
 | Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
 | Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
+| [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/statistics` | lifetime chapter total, when Jikan is down | nothing |
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
 Day-by-day numbers come from Jikan when it's up. When it isn't, they're reconstructed by diffing the daily snapshots the app stores locally on each refresh — which is why visiting daily keeps the chart complete.
+
+**On jikan-edge:** it's an independent reimplementation reading the same public MAL pages, suggested on [jikan-rest#612](https://github.com/jikan-me/jikan-rest/issues/612) during the August 2026 outage, and it serves stale-but-cached data where Jikan returns `504`. It's used only for the chapter total, because `/users/{user}/history` is on its documented list of routes it *cannot* serve — which is the one we'd most want. Its envelope is `{ data, meta }` with camelCase fields (`chaptersRead`, not `chapters_read`), so the total is read through a parser that accepts either dialect and returns nothing rather than guessing when it recognises neither.
 
 Your MAL list must be **public**, since every one of these reads your public profile.
 
