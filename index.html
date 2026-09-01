@@ -507,6 +507,46 @@ async function fetchMalListPublic(username) {
   return all;
 }
 
+// jikan-edge's manga list. Needs no proxy (it sends CORS headers) and no
+// key, which is what makes it the useful fallback when MAL refuses the
+// proxies' datacenter IPs — and it answers with its cached copy rather than
+// a 504 when its own upstream fetch fails.
+//
+// Field names come from the project's UserMediaListEntry type: malId, title,
+// progress (chapters read), status, updatedAt. Paginated via
+// meta.pagination.hasNextPage, limit max 300.
+async function fetchEdgeMangaList(username) {
+  const all = [];
+  for (let page = 1; page <= 20; page++) {
+    const url = `${EDGE_API}/users/${encodeURIComponent(username)}/mangalist?page=${page}&limit=300&_=${Date.now()}`;
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (!Array.isArray(json && json.data)) {
+      throw new Error((json && json.error && json.error.message) || 'unexpected body');
+    }
+    all.push(...json.data);
+    const pg = json.meta && json.meta.pagination;
+    if (!pg || !pg.hasNextPage) break;
+    await new Promise(r => setTimeout(r, 350)); // respect 30 req/10s
+  }
+  return all;
+}
+
+// camelCase -> the official API's structure. `progress` is the chapter
+// count; `updatedAt` restores the per-manga timestamp that load.json can't
+// give us, so near-midnight reads land on the right day again.
+function edgeRowsToItems(rows) {
+  return rows.map(r => ({
+    node: { id: r.malId, title: r.title },
+    list_status: {
+      status: r.status || undefined,
+      num_chapters_read: r.progress || 0,
+      updated_at: r.updatedAt || undefined,
+    },
+  }));
+}
+
 // Reshape public-list rows into the same structure the official API returns,
 // so snapshots, totals and titles all flow through unchanged. There's no
 // updated_at here — that only costs us the near-midnight day-attribution
@@ -813,7 +853,7 @@ function render() {
 
   $('main-content').innerHTML = `
     ${latestFetchError
-      ? `<div class="error-msg">⚠ couldn't refresh — ${latestFetchError}<br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.</div>`
+      ? `<div class="error-msg">⚠ couldn't refresh — every source failed:<br>${latestFetchError.slice(0, 400)}${latestFetchError.length > 400 ? '…' : ''}<br><br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.</div>`
       : (latestHistoryError
           ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
           : (noData > 0
@@ -901,23 +941,43 @@ function render() {
 //   it's actually likely to work.
 //
 // Returns which source answered so the UI can name it.
+const LIST_SOURCES = {
+  official: {
+    label: 'MAL API',
+    run: (username, clientId) => fetchMangaList(username, clientId),
+  },
+  public: {
+    label: 'MAL public list',
+    run: async username => publicRowsToItems(await fetchMalListPublic(username)),
+  },
+  edge: {
+    label: 'jikan-edge',
+    run: async username => edgeRowsToItems(await fetchEdgeMangaList(username)),
+  },
+};
+
 async function fetchMalData(username, clientId, useMal) {
   const errors = [];
   const asError = () => (errors.length ? errors.join(' · ') : null);
-  const officialFirst = useMal && !!getProxy();
 
-  for (const kind of (officialFirst ? ['official', 'public'] : ['public', 'official'])) {
+  // Default order puts the first-party endpoints first (freshest data) and
+  // jikan-edge after them, since it needs neither a proxy nor a key and
+  // therefore still answers when MAL is refusing the proxies' datacenter
+  // IPs. A configured custom proxy is the signal that the header path works,
+  // so the official API — the only one with per-manga updated_at — leads.
+  const order = useMal && getProxy()
+    ? ['official', 'public', 'edge']
+    : ['public', 'edge', 'official'];
+
+  for (const kind of order) {
     if (kind === 'official' && !useMal) continue;
+    const src = LIST_SOURCES[kind];
     try {
-      if (kind === 'official') {
-        return { data: await fetchMangaList(username, clientId), error: asError(), source: 'MAL API' };
-      }
-      const rows = await fetchMalListPublic(username);
-      return { data: publicRowsToItems(rows), error: asError(), source: 'MAL public list' };
+      return { data: await src.run(username, clientId), error: asError(), source: src.label };
     } catch (e) {
       // Keep going, but remember why — if a later source succeeds the UI
       // still explains which one it landed on.
-      errors.push(`${kind === 'official' ? 'official API' : 'public list'}: ${e.message}`);
+      errors.push(`${src.label}: ${e.message}`);
     }
   }
   return { data: null, error: asError(), source: null };
@@ -955,8 +1015,12 @@ async function refresh() {
 
     // Nothing came back at all. Don't throw — the view can still render from
     // stored snapshots, which is far more useful than a blank error page.
+    // Report every source that failed: showing only the Jikan error made an
+    // unreachable MAL look like a Jikan problem and hid the real cause.
     const gotNothing = !malResult.data && historyResult.error && totalResult.error;
-    latestFetchError = gotNothing ? historyResult.error : null;
+    latestFetchError = gotNothing
+      ? [malResult.error, historyResult.error].filter(Boolean).join(' · ')
+      : null;
 
     const snap = latestMangaList ? buildSnapshot(latestMangaList) : null;
     const total = snap ? snap.total : latestTotal;

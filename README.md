@@ -31,13 +31,18 @@ The app reads from several sources and uses whichever answers, so no single outa
 | MAL official API | the same, plus per-manga `updated_at` | a client ID **and** a header-forwarding proxy |
 | Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
 | Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
-| [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/statistics` | lifetime chapter total, when Jikan is down | nothing |
+| [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/mangalist` | per-manga chapter counts **and** `updatedAt`, with no proxy | nothing |
+| jikan-edge `/v1/users/{user}/statistics` | lifetime chapter total, when Jikan is down | nothing |
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
 Day-by-day numbers come from Jikan when it's up. When it isn't, they're reconstructed by diffing the daily snapshots the app stores locally on each refresh — which is why visiting daily keeps the chart complete.
 
-**On jikan-edge:** it's an independent reimplementation reading the same public MAL pages, suggested on [jikan-rest#612](https://github.com/jikan-me/jikan-rest/issues/612) during the August 2026 outage, and it serves stale-but-cached data where Jikan returns `504`. It's used only for the chapter total, because `/users/{user}/history` is on its documented list of routes it *cannot* serve — which is the one we'd most want. Its envelope is `{ data, meta }` with camelCase fields (`chaptersRead`, not `chapters_read`), so the total is read through a parser that accepts either dialect and returns nothing rather than guessing when it recognises neither.
+**On jikan-edge:** an independent reimplementation reading the same public MAL pages, suggested on [jikan-rest#612](https://github.com/jikan-me/jikan-rest/issues/612) during the August 2026 outage. Two properties make it the most useful fallback here: it needs **no proxy** (it sends CORS headers), so it still works when MAL refuses the public proxies' datacenter IPs; and when its own upstream fetch fails it answers `200` with `stale: true` from cache rather than `504`.
+
+It cannot serve `/users/{user}/history` — that's on its documented list of routes it can't do — so the 7-day chart still falls back to snapshot diffs. But its `mangalist` route carries `updatedAt` per entry, which MAL's `load.json` doesn't, so day attribution near midnight is actually *better* through this path than through the public list.
+
+The two APIs disagree about shape — `{ data, meta }` vs `{ data, pagination }`, camelCase vs snake_case — so responses are read through parsers that accept either dialect and return nothing, rather than a misleading `0`, when they recognise neither.
 
 Your MAL list must be **public**, since every one of these reads your public profile.
 
