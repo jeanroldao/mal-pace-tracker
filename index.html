@@ -217,6 +217,7 @@ const LS_ANCHOR_DATE    = 'mal_anchor_date';
 const LS_ANCHOR_TOTAL   = 'mal_anchor_total';
 const LS_SNAP_PFX       = 'mal_snap_';
 const LS_TITLES         = 'mal_titles';
+const LS_LAST_SOURCE    = 'mal_last_source';
 const LS_LAST_OK        = 'mal_last_ok';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
 const SCHEMA_VERSION = '4';
@@ -229,6 +230,25 @@ const SNAP_KEEP_DAYS = 30;
 const RETRY_BASE_MS = 30 * 1000;
 const RETRY_MAX_MS  = 10 * 60 * 1000;
 let retryDelayMs = RETRY_BASE_MS;
+// fetch() has no default timeout, so one hung proxy could stall a refresh
+// for as long as the browser was willing to wait — while a source that
+// answers in 300 ms sat behind it in the queue.
+const REQUEST_TIMEOUT_MS = 8000;
+
+function withTimeout(options = {}) {
+  if (typeof AbortSignal === 'undefined' || !AbortSignal.timeout) return options;
+  return { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
+}
+
+// An aborted fetch reports itself as "signal timed out" / AbortError, which
+// reads like a bug rather than a slow server.
+function describeFetchError(e) {
+  const msg = (e && e.message) || String(e);
+  if ((e && (e.name === 'TimeoutError' || e.name === 'AbortError')) || /abort|timed out/i.test(msg)) {
+    return `no response in ${REQUEST_TIMEOUT_MS / 1000}s`;
+  }
+  return msg || 'network error';
+}
 
 let autoRefreshTimer = null;
 let isRefreshing     = false;
@@ -344,7 +364,8 @@ function loadSettings() {
 function migrateIfNeeded() {
   if (localStorage.getItem(LS_SCHEMA_VERSION) === SCHEMA_VERSION) return;
   const keep = new Set([LS_USERNAME, LS_GOAL, LS_OFFSET, LS_PROXY, LS_CLIENTID,
-                        LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_TITLES, LS_LAST_OK, LS_SCHEMA_VERSION]);
+                        LS_ANCHOR_DATE, LS_ANCHOR_TOTAL, LS_TITLES, LS_LAST_OK,
+                        LS_LAST_SOURCE, LS_SCHEMA_VERSION]);
   Object.keys(localStorage).forEach(k => {
     if (!keep.has(k) && !k.startsWith(LS_SNAP_PFX)) localStorage.removeItem(k);
   });
@@ -471,10 +492,10 @@ async function fetchViaProxy(target, options, kind = 'header') {
   for (const template of ordered) {
     let res;
     try {
-      res = await fetch(buildProxiedUrl(template, target), options);
+      res = await fetch(buildProxiedUrl(template, target), withTimeout(options));
     } catch (e) {
       // TypeError: network error, DNS failure, or a blocked CORS preflight.
-      failures.push(`${proxyLabel(template)}: ${e.message || 'network error'}`);
+      failures.push(`${proxyLabel(template)}: ${describeFetchError(e)}`);
       continue;
     }
     if (res.ok) { workingProxy[kind] = template; return res; }
@@ -536,7 +557,7 @@ async function fetchEdgeMangaList(username) {
     // and Jikan came back as HTTP 400 here. `cache: 'no-store'` covers
     // freshness without inventing a parameter it doesn't know.
     const url = `${EDGE_API}/users/${encodeURIComponent(username)}/mangalist?page=${page}&limit=100`;
-    const res = await fetch(url, { cache: 'no-store' });
+    const res = await fetch(url, withTimeout({ cache: 'no-store' }));
     if (!res.ok) {
       const detail = await res.json().catch(() => null);
       const msg = detail && detail.error && (detail.error.message || detail.error.code);
@@ -609,7 +630,7 @@ async function fetchJikanHistory(username) {
   // The type is a PATH segment in Jikan's routing (`/history[/{type}]`) — as
   // a query param it was ignored and anime updates came back mixed in.
   try {
-    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history/manga?_=${Date.now()}`, { cache: 'no-store' });
+    const res = await fetch(`${JIKAN_API}/users/${encodeURIComponent(username)}/history/manga?_=${Date.now()}`, withTimeout({ cache: 'no-store' }));
     if (!res.ok) return { data: [], error: `Jikan HTTP ${res.status}` };
     const json = await res.json();
     return { data: json.data || [], error: null };
@@ -648,7 +669,7 @@ async function fetchJikanTotal(username) {
     try {
       // No cache-buster param — jikan-edge validates its query string and
       // rejects unknown keys with a 400.
-      const res = await fetch(src.url(user), { cache: 'no-store' });
+      const res = await fetch(src.url(user), withTimeout({ cache: 'no-store' }));
       if (!res.ok) { failures.push(`${src.name} HTTP ${res.status}`); continue; }
       const total = readChapterTotal(await res.json());
       if (total === null) { failures.push(`${src.name} returned no chapter total`); continue; }
@@ -995,21 +1016,36 @@ async function fetchMalData(username, clientId, useMal) {
   // therefore still answers when MAL is refusing the proxies' datacenter
   // IPs. A configured custom proxy is the signal that the header path works,
   // so the official API — the only one with per-manga updated_at — leads.
-  const order = useMal && getProxy()
+  const officialFirst = useMal && !!getProxy();
+  let order = officialFirst
     ? ['official', 'public', 'edge']
     : ['public', 'edge', 'official'];
+
+  // Whichever source answered last time goes first. Without this, every
+  // refresh re-walked a list of dead proxies before reaching the source
+  // already known to work — minutes of waiting for a sub-second answer.
+  // Skipped when a custom proxy is configured: that's an explicit request
+  // for the official API's richer data, and a speed heuristic shouldn't
+  // quietly downgrade it.
+  if (!officialFirst) {
+    const last = localStorage.getItem(LS_LAST_SOURCE);
+    if (last && order.includes(last)) order = [last, ...order.filter(k => k !== last)];
+  }
 
   for (const kind of order) {
     if (kind === 'official' && !useMal) continue;
     const src = LIST_SOURCES[kind];
     try {
-      return { data: await src.run(username, clientId), error: asError(), source: src.label };
+      const data = await src.run(username, clientId);
+      localStorage.setItem(LS_LAST_SOURCE, kind);
+      return { data, error: asError(), source: src.label };
     } catch (e) {
       // Keep going, but remember why — if a later source succeeds the UI
       // still explains which one it landed on.
       errors.push(`${src.label}: ${e.message}`);
     }
   }
+  localStorage.removeItem(LS_LAST_SOURCE);
   return { data: null, error: asError(), source: null };
 }
 
@@ -1029,19 +1065,57 @@ async function refresh() {
   render();
 
   try {
-    // Every source is best-effort: none of them individually failing should
-    // take the refresh down with it.
-    const [malResult, historyResult, totalResult] = await Promise.all([
-      fetchMalData(username, clientId, useMal),
-      fetchJikanHistory(username),
-      fetchJikanTotal(username),
-    ]);
-    latestMangaList    = malResult.data;
-    latestMalError     = malResult.error;
-    latestMalSource    = malResult.source;
-    latestHistory      = historyResult.data;
-    latestHistoryError = historyResult.error;
-    latestTotal        = totalResult.total;
+    // Every source is best-effort and independent, so each one paints the
+    // moment it lands instead of waiting behind the slowest. The list is
+    // what the whole view is built from — making it wait for a Jikan
+    // endpoint that is timing out meant staring at stale numbers for the
+    // full timeout even though the data had already arrived.
+    const malPromise = fetchMalData(username, clientId, useMal).then(r => {
+      latestMangaList = r.data;
+      latestMalError  = r.error;
+      latestMalSource = r.source;
+      if (r.data) {
+        const snap = buildSnapshot(r.data);
+        saveSnapshot(dateKey(0), {
+          perManga: snap.perManga, updatedAt: snap.updatedAt, total: snap.total,
+        });
+        pruneOldSnapshots();
+        // First refresh ever (or after a manual reset): anchor today's
+        // lifetime total so pace is measured against this moment onward.
+        if (!getAnchor()) setAnchor(dateKey(0), snap.total);
+        saveTitles(snap.titles);
+        localStorage.setItem(LS_LAST_OK, String(Date.now()));
+        latestFetchError = null;
+        $('last-updated').textContent =
+          `@${username} · updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+      }
+      isRefreshing = false;
+      render();
+      return r;
+    });
+
+    const historyPromise = fetchJikanHistory(username).then(r => {
+      latestHistory      = r.data;
+      latestHistoryError = r.error;
+      if (r.data && r.data.length) {
+        const fromHistory = {};
+        r.data.forEach(e => {
+          if (e && e.entry && e.entry.name) fromHistory[String(e.entry.mal_id)] = e.entry.name;
+        });
+        saveTitles(fromHistory);
+      }
+      render();
+      return r;
+    });
+
+    const totalPromise = fetchJikanTotal(username).then(r => {
+      latestTotal = r.total;
+      render();
+      return r;
+    });
+
+    const [malResult, historyResult, totalResult] =
+      await Promise.all([malPromise, historyPromise, totalPromise]);
 
     // Nothing came back at all. Don't throw — the view can still render from
     // stored snapshots, which is far more useful than a blank error page.
@@ -1052,32 +1126,14 @@ async function refresh() {
       ? [malResult.error, historyResult.error].filter(Boolean).join(' · ')
       : null;
 
-    const snap = latestMangaList ? buildSnapshot(latestMangaList) : null;
-    const total = snap ? snap.total : latestTotal;
-    if (total !== null && total !== undefined) {
-      saveSnapshot(dateKey(0), {
-        perManga: snap ? snap.perManga : {},
-        updatedAt: snap ? snap.updatedAt : {},
-        total,
-      });
+    // The list is the preferred basis for a snapshot and was already saved
+    // above; this only covers the case where it failed but a total arrived.
+    if (!malResult.data && latestTotal !== null && latestTotal !== undefined) {
+      saveSnapshot(dateKey(0), { perManga: {}, updatedAt: {}, total: latestTotal });
       pruneOldSnapshots();
-      // First refresh ever (or after a manual reset): anchor today's lifetime
-      // total so pace is measured against this moment going forward.
-      if (!getAnchor()) setAnchor(dateKey(0), total);
+      if (!getAnchor()) setAnchor(dateKey(0), latestTotal);
+      localStorage.setItem(LS_LAST_OK, String(Date.now()));
     }
-
-    // Remember titles from whichever source answered, so an offline render
-    // still names the manga.
-    if (snap) saveTitles(snap.titles);
-    if (latestHistory) {
-      const fromHistory = {};
-      latestHistory.forEach(e => {
-        if (e?.entry?.name) fromHistory[String(e.entry.mal_id)] = e.entry.name;
-      });
-      saveTitles(fromHistory);
-    }
-
-    if (!gotNothing) localStorage.setItem(LS_LAST_OK, String(Date.now()));
 
     isRefreshing = false;
     render();
