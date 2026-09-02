@@ -30,13 +30,16 @@ The app reads from several sources and uses whichever answers, so no single outa
 | **`myanimelist.net/mangalist/{user}/load.json`** | per-manga chapter counts — the endpoint MAL's own list page uses | a proxy, but **no key and no headers** |
 | MAL official API | the same, plus per-manga `updated_at` | a client ID **and** a header-forwarding proxy |
 | Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
+| `myanimelist.net/history/{user}/manga` | the same, parsed from the page itself — live, with exact timestamps | a proxy, but **no key and no headers** |
 | Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
 | [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/mangalist` | per-manga chapter counts **and** `updatedAt`, with no proxy | nothing |
 | jikan-edge `/v1/users/{user}/statistics` | lifetime chapter total, when Jikan is down | nothing |
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
-Day-by-day numbers come from Jikan when it's up. When it isn't, they're reconstructed by diffing the daily snapshots the app stores locally on each refresh — which is why visiting daily keeps the chart complete.
+Day-by-day numbers come from a history source when one is reachable: Jikan first, then MAL's own history page parsed in the browser. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
+
+That ordering matters for accuracy, not just availability. A snapshot diff can only say "this changed between two refreshes", so chapters read last night and first seen by this morning's refresh get attributed to *this morning*. A history source timestamps each read, so it puts them on the night they happened. MAL's page is live (Jikan's copy is cached), so when it is the source it takes precedence even for today.
 
 **On jikan-edge:** an independent reimplementation reading the same public MAL pages, suggested on [jikan-rest#612](https://github.com/jikan-me/jikan-rest/issues/612) during the August 2026 outage. Two properties make it the most useful fallback here: it needs **no proxy** (it sends CORS headers), so it still works when MAL refuses the public proxies' datacenter IPs; and when its own upstream fetch fails it answers `200` with `stale: true` from cache rather than `504`.
 

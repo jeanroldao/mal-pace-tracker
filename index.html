@@ -257,8 +257,9 @@ let isRefreshing     = false;
 let latestMangaList    = null;
 let latestMalError     = null;
 let latestMalSource    = null;
-let latestHistory      = null;
-let latestHistoryError = null;
+let latestHistory       = null;
+let latestHistoryError  = null;
+let latestHistorySource = null;
 let latestTotal        = null;
 // Set when a refresh reached nothing at all. The view keeps rendering from
 // stored snapshots; this only drives the "couldn't refresh" banner.
@@ -655,6 +656,100 @@ function readChapterTotal(json) {
   return null;
 }
 
+// MAL renders history timestamps as a mix of relative ("11 hours ago") and
+// absolute ("Aug 31, 3:52 PM") strings. Relative ones are timezone-proof,
+// which is exactly the form MAL uses for the last day — the window where
+// the today/yesterday boundary actually matters.
+function parseMalHistoryDate(text, now = Date.now()) {
+  let m;
+  if ((m = text.match(/(\d+)\s*(second|minute|hour|day|week)s?\s+ago/i))) {
+    const ms = { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5, week: 6048e5 };
+    return now - Number(m[1]) * ms[m[2].toLowerCase()];
+  }
+
+  const t = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  const withTime = d => {
+    if (t) {
+      let h = Number(t[1]) % 12;
+      if (/PM/i.test(t[3])) h += 12;
+      d.setHours(h, Number(t[2]), 0, 0);
+    } else {
+      d.setHours(12, 0, 0, 0);
+    }
+    return d.getTime();
+  };
+
+  if (/^\s*today/i.test(text))     return withTime(new Date(now));
+  if (/^\s*yesterday/i.test(text)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    return withTime(d);
+  }
+  // "Aug 31, 3:52 PM" — no year, so assume the most recent occurrence.
+  if ((m = text.match(/^\s*([A-Za-z]{3})[a-z]*\s+(\d{1,2})/))) {
+    const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+    const mo = months.indexOf(m[1].toLowerCase());
+    if (mo >= 0) {
+      const d = new Date(now);
+      d.setMonth(mo, Number(m[2]));
+      if (d.getTime() > now + 864e5) d.setFullYear(d.getFullYear() - 1);
+      return withTime(d);
+    }
+  }
+  // "09-01-26, 3:52 PM"
+  if ((m = text.match(/^\s*(\d{1,2})-(\d{1,2})-(\d{2})/))) {
+    return withTime(new Date(2000 + Number(m[3]), Number(m[1]) - 1, Number(m[2])));
+  }
+  return null;
+}
+
+// MAL's own history page — the page Jikan scrapes. No auth and no custom
+// header, so it rides the simple-proxy path, and unlike Jikan it is live
+// rather than cached. Returns entries shaped like Jikan's so the rest of
+// the pipeline is unchanged.
+//
+// Row structure per Jikan's HistoryItemParser: td[1]/a carries
+// /manga.php?id=N and the title, td[1]/strong the chapter, td[2] the date.
+async function fetchMalHistoryPublic(username) {
+  if (typeof DOMParser === 'undefined') throw new Error('no HTML parser available');
+  const url = `${MAL_SITE}/history/${encodeURIComponent(username)}/manga`;
+  const res = await fetchViaProxy(url, { cache: 'no-store' }, 'simple');
+  const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+
+  const out = [];
+  doc.querySelectorAll('#content table tr').forEach(tr => {
+    const cells = tr.querySelectorAll('td');
+    if (cells.length < 2) return;
+    const link = cells[0].querySelector('a[href*="manga.php?id="]');
+    if (!link) return;                       // anime rows and headers
+    const id = (link.getAttribute('href').match(/id=(\d+)/) || [])[1];
+    if (!id) return;
+    const when = parseMalHistoryDate(cells[1].textContent || '');
+    if (!when) return;
+    const strong = cells[0].querySelector('strong');
+    out.push({
+      entry: { mal_id: Number(id), name: (link.textContent || '').trim() },
+      increment: strong ? parseInt(strong.textContent, 10) || 0 : 0,
+      date: new Date(when).toISOString(),
+    });
+  });
+  if (out.length === 0) throw new Error('no history rows found — is the profile public?');
+  return out;
+}
+
+// History, in order of preference. MAL's own page is live and exact; Jikan
+// is cached but has been the long-standing source, so it is tried first
+// while it is healthy and the page takes over when it is not.
+async function fetchHistory(username) {
+  const jikan = await fetchJikanHistory(username);
+  if (!jikan.error) return { ...jikan, source: 'Jikan' };
+  try {
+    return { data: await fetchMalHistoryPublic(username), error: null, source: 'MAL history page' };
+  } catch (e) {
+    return { data: [], error: `${jikan.error} · MAL history page: ${e.message}`, source: null };
+  }
+}
+
 // Lifetime chapter count — no auth, no proxy, either source. Tried in order
 // so an outage at one doesn't cost us the anchor/pace math.
 const TOTAL_SOURCES = [
@@ -835,12 +930,19 @@ function render() {
     let count = null;
     const byTitle = {};
     if (i === 0) {
-      // Today: snapshot diff is authoritative (real-time MAL, includes reads
-      // Jikan hasn't propagated yet). Falls back to Jikan's today bucket,
-      // then to the "manga touched today" updated_at heuristic.
+      // Today: a live history source wins, because it timestamps each read.
+      // Snapshot diffs can only say "this changed between two refreshes",
+      // so last night's reads picked up by this morning's refresh landed on
+      // today. Jikan's copy is cached and can lag, so it stays behind the
+      // snapshot diff; MAL's own page is live and goes in front of it.
       const snapReads  = snapDaily[dKey];
       const jikanReads = jikanGrouped.byDay[dKey];
-      if (snapReads) {
+      const liveHistory = latestHistorySource === 'MAL history page';
+      if (liveHistory && jikanReads) {
+        count = entriesToCount(jikanReads, byTitle);
+      } else if (liveHistory && latestHistory && latestHistory.length) {
+        count = 0;                       // live history says nothing today
+      } else if (snapReads) {
         count = entriesToCount(snapReads, byTitle);
       } else if (jikanReads) {
         count = entriesToCount(jikanReads, byTitle);
@@ -906,7 +1008,7 @@ function render() {
     ${latestFetchError
       ? `<div class="error-msg">⚠ couldn't refresh — every source failed:<br>${latestFetchError.slice(0, 400)}${latestFetchError.length > 400 ? '…' : ''}<br><br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.</div>`
       : (latestHistoryError
-          ? `<div class="error-msg">⚠ couldn't load Jikan history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
+          ? `<div class="error-msg">⚠ couldn't load reading history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
           : (noData > 0
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
@@ -1094,9 +1196,10 @@ async function refresh() {
       return r;
     });
 
-    const historyPromise = fetchJikanHistory(username).then(r => {
-      latestHistory      = r.data;
-      latestHistoryError = r.error;
+    const historyPromise = fetchHistory(username).then(r => {
+      latestHistory       = r.data;
+      latestHistoryError  = r.error;
+      latestHistorySource = r.source;
       if (r.data && r.data.length) {
         const fromHistory = {};
         r.data.forEach(e => {
