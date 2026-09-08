@@ -233,7 +233,10 @@ let retryDelayMs = RETRY_BASE_MS;
 // fetch() has no default timeout, so one hung proxy could stall a refresh
 // for as long as the browser was willing to wait — while a source that
 // answers in 300 ms sat behind it in the queue.
-const REQUEST_TIMEOUT_MS = 8000;
+// Generous because proxies are raced, not walked: the whole attempt costs
+// one timeout rather than one per proxy. MAL's history page is a full HTML
+// document, and 8s was cutting off proxies that would have finished.
+const REQUEST_TIMEOUT_MS = 12000;
 
 // Caps a request, and optionally also honours a caller's signal so a raced
 // attempt can be cancelled the moment a sibling wins.
@@ -267,6 +270,8 @@ let latestHistory       = null;
 let latestHistoryError  = null;
 let latestHistorySource = null;
 let latestTotal        = null;
+// Cache state of the list, when the source reports one (jikan-edge does).
+let latestListMeta     = null;
 // Set when a refresh reached nothing at all. The view keeps rendering from
 // stored snapshots; this only drives the "couldn't refresh" banner.
 let latestFetchError   = null;
@@ -614,6 +619,16 @@ async function fetchEdgeMangaList(username) {
       throw new Error((json && json.error && json.error.message) || 'unexpected body');
     }
     all.push(...json.data);
+    // Every jikan-edge response carries its own cache state. When its
+    // upstream fetch fails it answers 200 with stale:true rather than a
+    // 504 — useful, but it means recent reads can be missing, which
+    // otherwise looks like the app losing them.
+    if (page === 1 && json.meta) {
+      latestListMeta = {
+        stale: !!(json.meta.stale || json.meta.refreshFailed),
+        fetchedAt: json.meta.fetchedAt || null,
+      };
+    }
     const pg = json.meta && json.meta.pagination;
     if (!pg || !pg.hasNextPage) break;
     await new Promise(r => setTimeout(r, 350)); // respect 30 req/10s
@@ -1060,6 +1075,9 @@ function render() {
           : (noData > 0
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
+    ${latestMangaList && latestListMeta && latestListMeta.stale
+      ? `<div class="error-msg">⚠ your list came from <strong>${latestMalSource}</strong>'s <strong>cached copy</strong>${latestListMeta.fetchedAt ? `, taken ${relativeTime(Date.parse(latestListMeta.fetchedAt))}` : ''} — it couldn't reach MAL to refresh. Chapters read since then won't appear here yet. This clears once MAL is reachable again, or immediately with your own proxy (see the README).</div>`
+      : ''}
     ${latestMalError && latestMangaList
       ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong> — ${latestMalError.slice(0, 130)}${latestMalError.length > 130 ? '…' : ''}</div>`
       : ''}
@@ -1159,6 +1177,7 @@ const LIST_SOURCES = {
 
 async function fetchMalData(username, clientId, useMal) {
   const errors = [];
+  latestListMeta = null;
   const asError = () => (errors.length ? errors.join(' · ') : null);
 
   // Default order puts the first-party endpoints first (freshest data) and
@@ -1171,23 +1190,18 @@ async function fetchMalData(username, clientId, useMal) {
     ? ['official', 'public', 'edge']
     : ['public', 'edge', 'official'];
 
-  // Whichever source answered last time goes first. Without this, every
-  // refresh re-walked a list of dead proxies before reaching the source
-  // already known to work — minutes of waiting for a sub-second answer.
-  // Skipped when a custom proxy is configured: that's an explicit request
-  // for the official API's richer data, and a speed heuristic shouldn't
-  // quietly downgrade it.
-  if (!officialFirst) {
-    const last = localStorage.getItem(LS_LAST_SOURCE);
-    if (last && order.includes(last)) order = [last, ...order.filter(k => k !== last)];
-  }
+  // Note: no "whichever worked last goes first" shortcut here. These sources
+  // are not interchangeable — jikan-edge serves a cached copy, so preferring
+  // it because it answered quickly last time pinned the app to stale data
+  // and stopped it ever retrying MAL's live endpoint. Chapters read minutes
+  // ago then never appeared. Proxies are still remembered individually,
+  // which is safe because that choice doesn't affect freshness.
 
   for (const kind of order) {
     if (kind === 'official' && !useMal) continue;
     const src = LIST_SOURCES[kind];
     try {
       const data = await src.run(username, clientId);
-      localStorage.setItem(LS_LAST_SOURCE, kind);
       return { data, error: asError(), source: src.label };
     } catch (e) {
       // Keep going, but remember why — if a later source succeeds the UI
@@ -1195,7 +1209,6 @@ async function fetchMalData(username, clientId, useMal) {
       errors.push(`${src.label}: ${e.message}`);
     }
   }
-  localStorage.removeItem(LS_LAST_SOURCE);
   return { data: null, error: asError(), source: null };
 }
 
