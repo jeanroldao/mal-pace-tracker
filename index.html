@@ -235,9 +235,15 @@ let retryDelayMs = RETRY_BASE_MS;
 // answers in 300 ms sat behind it in the queue.
 const REQUEST_TIMEOUT_MS = 8000;
 
-function withTimeout(options = {}) {
+// Caps a request, and optionally also honours a caller's signal so a raced
+// attempt can be cancelled the moment a sibling wins.
+function withTimeout(options = {}, extraSignal) {
   if (typeof AbortSignal === 'undefined' || !AbortSignal.timeout) return options;
-  return { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const signal = extraSignal && AbortSignal.any
+    ? AbortSignal.any([timeout, extraSignal])
+    : timeout;
+  return { ...options, signal };
 }
 
 // An aborted fetch reports itself as "signal timed out" / AbortError, which
@@ -482,29 +488,68 @@ function proxyCandidates(kind) {
 // independent proxies relayed the *same* error, that's the target speaking
 // and it gets surfaced directly; otherwise each proxy failed its own way and
 // the caller gets the full list.
+//
+// The candidates are raced rather than walked. Walking them meant paying
+// each dead proxy's timeout end to end — two proxies hanging 8s apiece put
+// 16s in front of a page that was never going to load. Racing bounds the
+// whole attempt by the slowest single request instead of their sum, and the
+// losers are aborted the moment one wins.
+function attemptProxy(template, target, options, signal) {
+  return (async () => {
+    const res = await fetch(buildProxiedUrl(template, target), withTimeout(options, signal));
+    if (res.ok) return { res, template };
+    const body = await res.json().catch(() => null);
+    const relayed = body && !Array.isArray(body) && (body.message || body.error);
+    const err = new Error(relayed ? String(relayed) : `HTTP ${res.status}`);
+    err.template = template;
+    err.relayed  = relayed ? String(relayed) : null;
+    throw err;
+  })();
+}
+
+async function raceProxies(templates, target, options, kind) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const attempts = templates.map(t =>
+    attemptProxy(t, target, options, controller && controller.signal).catch(e => {
+      if (!e.template) e.template = t;
+      throw e;
+    }));
+  try {
+    const winner = await Promise.any(attempts);
+    workingProxy[kind] = winner.template;
+    if (controller) controller.abort();   // stop the losers mid-flight
+    return { res: winner.res };
+  } catch (aggregate) {
+    const errors = (aggregate && aggregate.errors) || [];
+    return {
+      failures: errors.map(e => `${proxyLabel(e.template)}: ${describeFetchError(e)}`),
+      relayed:  errors.map(e => e.relayed).filter(Boolean),
+    };
+  }
+}
+
 async function fetchViaProxy(target, options, kind = 'header') {
+  const candidates = proxyCandidates(kind);
   const remembered = workingProxy[kind];
-  const ordered = remembered
-    ? [remembered, ...proxyCandidates(kind).filter(p => p !== remembered)]
-    : proxyCandidates(kind);
   const failures = [];
   const relayed = [];
 
-  for (const template of ordered) {
-    let res;
-    try {
-      res = await fetch(buildProxiedUrl(template, target), withTimeout(options));
-    } catch (e) {
-      // TypeError: network error, DNS failure, or a blocked CORS preflight.
-      failures.push(`${proxyLabel(template)}: ${describeFetchError(e)}`);
-      continue;
-    }
-    if (res.ok) { workingProxy[kind] = template; return res; }
+  // A proxy that already worked gets a solo attempt, so the steady state
+  // stays a single request rather than a six-way fan-out.
+  if (remembered && candidates.includes(remembered)) {
+    const solo = await raceProxies([remembered], target, options, kind);
+    if (solo.res) return solo.res;
+    failures.push(...solo.failures);
+    relayed.push(...solo.relayed);
+    workingProxy[kind] = null;
+  }
 
-    const body = await res.json().catch(() => null);
-    const msg = body && !Array.isArray(body) && (body.message || body.error);
-    if (msg) relayed.push(String(msg));
-    failures.push(`${proxyLabel(template)}: ${msg ? String(msg) : 'HTTP ' + res.status}`);
+  const rest = candidates.filter(t => t !== remembered);
+  if (rest.length) {
+    const raced = await raceProxies(rest, target, options, kind);
+    if (raced.res) return raced.res;
+    failures.push(...raced.failures);
+    relayed.push(...raced.relayed);
   }
 
   workingProxy[kind] = null;
@@ -737,17 +782,20 @@ async function fetchMalHistoryPublic(username) {
   return out;
 }
 
-// History, in order of preference. MAL's own page is live and exact; Jikan
-// is cached but has been the long-standing source, so it is tried first
-// while it is healthy and the page takes over when it is not.
+// History, in order of preference. MAL's own page leads: it is live and
+// timestamps every read, where Jikan serves a cached copy — and Jikan has
+// been returning 504 on every endpoint since 2026-08-28, so leading with it
+// only bought a wasted round trip per refresh.
 async function fetchHistory(username) {
-  const jikan = await fetchJikanHistory(username);
-  if (!jikan.error) return { ...jikan, source: 'Jikan' };
+  let firstError = null;
   try {
     return { data: await fetchMalHistoryPublic(username), error: null, source: 'MAL history page' };
   } catch (e) {
-    return { data: [], error: `${jikan.error} · MAL history page: ${e.message}`, source: null };
+    firstError = `MAL history page: ${e.message}`;
   }
+  const jikan = await fetchJikanHistory(username);
+  if (!jikan.error) return { ...jikan, source: 'Jikan' };
+  return { data: [], error: `${firstError} · ${jikan.error}`, source: null };
 }
 
 // Lifetime chapter count — no auth, no proxy, either source. Tried in order
@@ -1211,14 +1259,17 @@ async function refresh() {
       return r;
     });
 
-    const totalPromise = fetchJikanTotal(username).then(r => {
-      latestTotal = r.total;
+    // The lifetime total is only fetched when the list didn't arrive: a
+    // successful list already sums to it, so asking an API for a number we
+    // are holding was a wasted round trip on every refresh.
+    const malResult = await malPromise;
+    let totalResult = { total: null, error: null, source: null };
+    if (!malResult.data) {
+      totalResult = await fetchJikanTotal(username);
+      latestTotal = totalResult.total;
       render();
-      return r;
-    });
-
-    const [malResult, historyResult, totalResult] =
-      await Promise.all([malPromise, historyPromise, totalPromise]);
+    }
+    const historyResult = await historyPromise;
 
     // Nothing came back at all. Don't throw — the view can still render from
     // stored snapshots, which is far more useful than a blank error page.

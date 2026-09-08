@@ -37,7 +37,9 @@ The app reads from several sources and uses whichever answers, so no single outa
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
-Day-by-day numbers come from a history source when one is reachable: Jikan first, then MAL's own history page parsed in the browser. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
+Day-by-day numbers come from a history source when one is reachable: MAL's own history page parsed in the browser, then Jikan. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
+
+Jikan is last on purpose. It has been returning `504` on every endpoint since 2026-08-28, and it serves a cached copy even when healthy, so leading with it cost a wasted round trip per refresh and gave staler answers than MAL's own page.
 
 That ordering matters for accuracy, not just availability. A snapshot diff can only say "this changed between two refreshes", so chapters read last night and first seen by this morning's refresh get attributed to *this morning*. A history source timestamps each read, so it puts them on the night they happened. MAL's page is live (Jikan's copy is cached), so when it is the source it takes precedence even for today.
 
@@ -66,7 +68,7 @@ Nothing on `myanimelist.net` sends CORS headers, so a browser can't read it with
 
 Jikan needs no proxy at all, since it sends its own CORS headers.
 
-The app tries its proxies in order and names each one and its failure reason if they all fall over. Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
+The app **races** its proxies rather than trying them one at a time, and aborts the losers as soon as one answers. Walking them meant paying each dead proxy's timeout end to end — two hanging for 8s apiece put 16s in front of a page that was never going to load. A proxy that has already worked gets a solo attempt first, so the steady state is a single request. If they all fall over, the error names each one and its reason. Public proxies are unreliable by nature — they add API-key requirements, origin allowlists, or simply disappear. **The durable fix is to run your own**, which is free and takes about five minutes:
 
 1. Sign in at [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **Create Worker**.
 2. Replace the worker code with:
