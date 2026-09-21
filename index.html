@@ -149,6 +149,18 @@
   }
   .anchor-info button:hover { color: var(--text); }
 
+  .worker-help { margin-top: 4px; }
+  .worker-help summary {
+    cursor: pointer; font-weight: 500; padding: 4px 0;
+  }
+  .worker-help p, .worker-help li { margin: 6px 0; line-height: 1.6; }
+  .worker-help ol { padding-left: 1.2em; }
+  .worker-help pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; margin: 8px 0; overflow-x: auto;
+    font-size: 11px; line-height: 1.5; color: var(--text); white-space: pre;
+  }
+
   .build-info {
     font-size: 10px; font-family: var(--mono); color: var(--muted);
     text-align: center; margin-top: 2rem; padding-top: 1rem;
@@ -317,6 +329,8 @@ const HEADER_PROXIES = [
 const SIMPLE_PROXIES = [
   'https://api.allorigins.win/raw?url={url}',
   'https://api.codetabs.com/v1/proxy?quest={url}',
+  'https://proxy.corsfix.com/?{raw}',
+  'https://api.allorigins.win/raw?charset=UTF-8&url={url}',
   'https://api.cors.lol/?url={url}',
   'https://cors.eu.org/{raw}',
   'https://test.cors.workers.dev/?{raw}',
@@ -623,10 +637,14 @@ async function fetchEdgeMangaList(username) {
     // upstream fetch fails it answers 200 with stale:true rather than a
     // 504 — useful, but it means recent reads can be missing, which
     // otherwise looks like the app losing them.
-    if (page === 1 && json.meta) {
+    if (page === 1) {
+      const meta = json.meta || {};
       latestListMeta = {
-        stale: !!(json.meta.stale || json.meta.refreshFailed),
-        fetchedAt: json.meta.fetchedAt || null,
+        stale: !!(meta.stale || meta.refreshFailed),
+        // `stale` only means "the last refresh failed". A copy whose refresh
+        // succeeded hours ago still reports stale:false while missing
+        // everything read since — so the age matters more than the flag.
+        fetchedAt: meta.fetchedAt || (json.data[0] && json.data[0].fetchedAt) || null,
       };
     }
     const pg = json.meta && json.meta.pagination;
@@ -934,6 +952,47 @@ function computeDailyReads(snaps) {
   return daily;
 }
 
+// Shown wherever the app is stuck behind a cache or a dead proxy. The code
+// is inline rather than a link to the README because this is the one fix
+// that ends the whole class of problem, and it should be readable at the
+// moment the problem is on screen.
+const workerHelp = `
+  <details class="worker-help">
+    <summary>Fix this permanently — your own proxy (free, ~5 min)</summary>
+    <p>MAL sends no CORS headers, so a browser needs a relay. The public ones
+    are rate-limited, key-walled or blocked. One you own is neither.</p>
+    <ol>
+      <li>Sign in at <strong>dash.cloudflare.com</strong> → Workers &amp; Pages → Create Worker</li>
+      <li>Replace the code with this, then Deploy:</li>
+    </ol>
+    <pre>export default {
+  async fetch(request) {
+    const target = new URL(request.url).searchParams.get('url');
+    if (!target) return new Response('missing ?url=', { status: 400 });
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': 'GET,OPTIONS',
+      }});
+    }
+    const upstream = await fetch(target, {
+      headers: { 'X-MAL-CLIENT-ID': request.headers.get('X-MAL-CLIENT-ID') || '' },
+    });
+    const res = new Response(upstream.body, upstream);
+    res.headers.set('Access-Control-Allow-Origin', '*');
+    return res;
+  },
+};</pre>
+    <ol start="3">
+      <li>Copy the worker URL and paste
+      <strong>https://your-worker.workers.dev/?url=</strong> into the
+      <strong>proxy</strong> field above.</li>
+    </ol>
+    <p>That gives live MAL data: today's count updates the moment you log a
+    chapter, and the 7-day chart comes from MAL's own history page.</p>
+  </details>`;
+
 function render() {
   const goal  = getGoal();
   const snaps = allSnapshots();
@@ -1067,17 +1126,29 @@ function render() {
   const todayTitlesSorted = Object.entries(todayEntry.byTitle).sort((a, b) => b[1] - a[1]);
   const lastOkLabel = relativeTime(parseInt(localStorage.getItem(LS_LAST_OK), 10));
 
+  // A mirror's copy can be minutes or hours behind MAL while still reporting
+  // itself healthy — `stale` only means "the last refresh failed". Judge it
+  // by age instead, so a blank day comes with the reason attached rather
+  // than looking like the app lost the reads.
+  const cacheAgeMs = latestListMeta && latestListMeta.fetchedAt
+    ? Date.now() - Date.parse(latestListMeta.fetchedAt) : null;
+  const cacheIsBehind = latestMangaList && latestListMeta &&
+    (latestListMeta.stale || (Number.isFinite(cacheAgeMs) && cacheAgeMs > 15 * 60 * 1000));
+  const cacheWarning = cacheIsBehind
+    ? `<div class="error-msg">⚠ your list is <strong>${latestMalSource}</strong>'s cached copy${
+        Number.isFinite(cacheAgeMs) ? `, taken ${relativeTime(Date.parse(latestListMeta.fetchedAt))}` : ''
+      }${latestListMeta.stale ? ' (it could not reach MAL to refresh)' : ''} — anything read since then is <strong>not in it yet</strong>, so today can read as empty even when it isn't.<br><br>${workerHelp}</div>`
+    : '';
+
   $('main-content').innerHTML = `
     ${latestFetchError
-      ? `<div class="error-msg">⚠ couldn't refresh — every source failed:<br>${latestFetchError.slice(0, 400)}${latestFetchError.length > 400 ? '…' : ''}<br><br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.</div>`
+      ? `<div class="error-msg">⚠ couldn't refresh — every source failed:<br>${latestFetchError.slice(0, 400)}${latestFetchError.length > 400 ? '…' : ''}<br><br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.<br><br>${workerHelp}</div>`
       : (latestHistoryError
           ? `<div class="error-msg">⚠ couldn't load reading history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
           : (noData > 0
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
-    ${latestMangaList && latestListMeta && latestListMeta.stale
-      ? `<div class="error-msg">⚠ your list came from <strong>${latestMalSource}</strong>'s <strong>cached copy</strong>${latestListMeta.fetchedAt ? `, taken ${relativeTime(Date.parse(latestListMeta.fetchedAt))}` : ''} — it couldn't reach MAL to refresh. Chapters read since then won't appear here yet. This clears once MAL is reachable again, or immediately with your own proxy (see the README).</div>`
-      : ''}
+    ${cacheWarning}
     ${latestMalError && latestMangaList
       ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong> — ${latestMalError.slice(0, 130)}${latestMalError.length > 130 ? '…' : ''}</div>`
       : ''}
