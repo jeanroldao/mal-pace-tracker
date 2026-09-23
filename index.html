@@ -485,6 +485,22 @@ function buildProxiedUrl(template, target) {
   return template + encodeURIComponent(target);
 }
 
+// A custom proxy is usually pasted from a provider's "sample request", which
+// ends in a placeholder target like https%3A%2F%2Fexample.com. Left in place,
+// the real URL gets glued onto the end of it and every request is malformed —
+// which surfaces as a confusing error from the proxy rather than from us.
+function proxyConfigWarning() {
+  const p = getProxy();
+  if (!p) return null;
+  if (/example\.(com|org)/i.test(p)) {
+    return `your proxy still has the provider's sample target in it — replace that trailing URL with <strong>{url}</strong>`;
+  }
+  if (!/\{url\}|\{raw\}/.test(p) && !/[=/]$/.test(p)) {
+    return `your proxy has no <strong>{url}</strong> placeholder and doesn't end in "=" or "/", so the target will be appended directly to it`;
+  }
+  return null;
+}
+
 // Proxy list to try, in order: the user's own proxy first (if set), then
 // the built-in ones for this request kind.
 function proxyCandidates(kind) {
@@ -1130,6 +1146,7 @@ function render() {
   // itself healthy — `stale` only means "the last refresh failed". Judge it
   // by age instead, so a blank day comes with the reason attached rather
   // than looking like the app lost the reads.
+  const proxyWarning = proxyConfigWarning();
   const cacheAgeMs = latestListMeta && latestListMeta.fetchedAt
     ? Date.now() - Date.parse(latestListMeta.fetchedAt) : null;
   const cacheIsBehind = latestMangaList && latestListMeta &&
@@ -1148,6 +1165,7 @@ function render() {
           : (noData > 0
               ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
               : ''))}
+    ${proxyWarning ? `<div class="error-msg">⚠ ${proxyWarning}.<br>Example: <strong>https://corsproxy.io/?key=YOUR_KEY&url={url}</strong></div>` : ''}
     ${cacheWarning}
     ${latestMalError && latestMangaList
       ? `<div class="notice">ℹ reading your list from the <strong>${latestMalSource}</strong> — ${latestMalError.slice(0, 130)}${latestMalError.length > 130 ? '…' : ''}</div>`
