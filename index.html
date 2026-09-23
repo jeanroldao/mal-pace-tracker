@@ -495,6 +495,12 @@ function proxyConfigWarning() {
   if (/example\.(com|org)/i.test(p)) {
     return `your proxy still has the provider's sample target in it — replace that trailing URL with <strong>{url}</strong>`;
   }
+  // The documented Worker reads the target from ?url=. A bare origin ends in
+  // "/", which passes the generic check below while still sending the target
+  // as a path the Worker never looks at — it answers "missing ?url=".
+  if (/workers\.dev/i.test(p) && !/url=/i.test(p)) {
+    return `your Worker expects the target in <strong>?url=</strong> — add it, e.g. <strong>${p.replace(/\/?$/, '/')}?url={url}</strong>`;
+  }
   if (!/\{url\}|\{raw\}/.test(p) && !/[=/]$/.test(p)) {
     return `your proxy has no <strong>{url}</strong> placeholder and doesn't end in "=" or "/", so the target will be appended directly to it`;
   }
@@ -543,16 +549,22 @@ function attemptProxy(template, target, options, signal) {
 }
 
 async function raceProxies(templates, target, options, kind) {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const attempts = templates.map(t =>
-    attemptProxy(t, target, options, controller && controller.signal).catch(e => {
-      if (!e.template) e.template = t;
-      throw e;
-    }));
+  // One controller per attempt. A single shared one looked tidier but
+  // aborting the losers also aborted the winner — whose body the caller has
+  // not read yet — so every raced request died with "signal is aborted
+  // without reason" the moment it succeeded.
+  const controllers = templates.map(() =>
+    typeof AbortController !== 'undefined' ? new AbortController() : null);
+  const attempts = templates.map((t, i) =>
+    attemptProxy(t, target, options, controllers[i] && controllers[i].signal)
+      .then(r => ({ ...r, index: i }), e => {
+        if (!e.template) e.template = t;
+        throw e;
+      }));
   try {
     const winner = await Promise.any(attempts);
     workingProxy[kind] = winner.template;
-    if (controller) controller.abort();   // stop the losers mid-flight
+    controllers.forEach((c, i) => { if (c && i !== winner.index) c.abort(); });
     return { res: winner.res };
   } catch (aggregate) {
     const errors = (aggregate && aggregate.errors) || [];
