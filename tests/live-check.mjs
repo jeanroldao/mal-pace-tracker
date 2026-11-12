@@ -11,6 +11,8 @@
 // Env:  CHROME_PATH  use this Chromium binary instead of Playwright's own
 //       SETTLE_MS    extra wait after the list loads, for history (default 4000)
 //       SCREENSHOT   where to save the screenshot (default live-check.png)
+//       REDACT=1     print <user> / <proxy> instead of the real values
+//                    (on by default under GitHub Actions, where logs are public)
 //
 // Exit code 0 when today's count rendered as a number, 1 otherwise.
 import { createServer } from 'http';
@@ -44,14 +46,31 @@ const page = await browser.newPage();
 // Every request the app makes, and how it ended.
 const requests = new Map();
 const host = url => { try { return new URL(url).host; } catch (_) { return url; } };
-const short = url => url.replace(origin, '').slice(0, 110);
+
+// Redaction happens here, on the full string and before any truncation: a
+// log-level mask only matches the exact value, so a URL cut off mid-username
+// slips straight past it.
+const redact = process.env.REDACT ? process.env.REDACT !== '0' : process.env.GITHUB_ACTIONS === 'true';
+const escapeRe = v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const hidden = [];
+if (redact) {
+  const p = proxy.trim();
+  if (p) {
+    hidden.push([p, '<proxy>']);
+    const h = host(/^[a-z]+:\/\//i.test(p) ? p : `https://${p}`);
+    if (h) hidden.push([`https://${h}`, '<proxy>'], [h, '<proxy>']);
+  }
+  hidden.push([username, '<user>']);
+}
+const clean = text => hidden.reduce(
+  (t, [value, label]) => t.replace(new RegExp(escapeRe(value), 'gi'), label), String(text));
 page.on('request',        r => requests.set(r, { url: r.url(), outcome: 'pending' }));
 page.on('response',       r => { const e = requests.get(r.request()); if (e) e.outcome = `HTTP ${r.status()}`; });
 page.on('requestfailed',  r => { const e = requests.get(r); if (e) e.outcome = (r.failure() || {}).errorText || 'failed'; });
 const pageErrors = [];
 page.on('pageerror', e => pageErrors.push(e.message));
 const consoleErrors = [];
-page.on('console', m => { if (m.type() === 'error') consoleErrors.push(m.text().slice(0, 200)); });
+page.on('console', m => { if (m.type() === 'error') consoleErrors.push(m.text()); });
 
 // A clean profile with just the settings under test — the same keys the app
 // writes itself (see the LS_* constants in index.html).
@@ -73,7 +92,7 @@ const status   = (await page.textContent('#last-updated')).trim();
 const proxyUse = await page.inputValue('#proxy-input');
 const today    = (await page.textContent('.metric-value').catch(() => '')).trim();
 const banners  = await page.$$eval('#main-content .error-msg, #main-content .notice',
-  els => els.map(e => `${e.className.includes('error') ? 'ERROR ' : 'notice'} ${e.innerText.replace(/\s+/g, ' ').slice(0, 300)}`));
+  els => els.map(e => [e.className.includes('error') ? 'ERROR ' : 'notice', e.innerText.replace(/\s+/g, ' ')]));
 const rendered = (await page.innerText('#main-content'))
   .split('\n').map(l => l.trim()).filter(Boolean);
 
@@ -82,24 +101,24 @@ await page.screenshot({ path: shot, fullPage: true });
 await browser.close();
 server.close();
 
-console.log(`proxy entered : ${proxy.trim() || '(none)'}`);
-console.log(`proxy used    : ${proxyUse || '(none)'}`);
-console.log(`status line   : ${status}`);
+console.log(`proxy entered : ${clean(proxy.trim()) || '(none)'}`);
+console.log(`proxy used    : ${clean(proxyUse) || '(none)'}`);
+console.log(`status line   : ${clean(status)}`);
 console.log(`today         : ${today}`);
 
 console.log('\nbanners:');
-console.log(banners.length ? banners.map(b => `  ${b}`).join('\n') : '  (none)');
+console.log(banners.length ? banners.map(([kind, text]) => `  ${kind} ${clean(text).slice(0, 300)}`).join('\n') : '  (none)');
 
 console.log('\nrequests:');
 [...requests.values()]
   .filter(r => !r.url.startsWith(origin))
-  .forEach(r => console.log(`  ${r.outcome.padEnd(28)} ${host(r.url).padEnd(46)} ${short(r.url)}`));
+  .forEach(r => console.log(`  ${r.outcome.padEnd(34)} ${clean(host(r.url)).padEnd(26)} ${clean(r.url).slice(0, 110)}`));
 
-if (pageErrors.length)    { console.log('\npage errors:');    pageErrors.forEach(e => console.log(`  ${e}`)); }
-if (consoleErrors.length) { console.log('\nconsole errors:'); consoleErrors.forEach(e => console.log(`  ${e}`)); }
+if (pageErrors.length)    { console.log('\npage errors:');    pageErrors.forEach(e => console.log(`  ${clean(e)}`)); }
+if (consoleErrors.length) { console.log('\nconsole errors:'); consoleErrors.forEach(e => console.log(`  ${clean(e).slice(0, 200)}`)); }
 
 console.log('\nrendered page:');
-console.log(rendered.map(l => `  ${l}`).join('\n'));
+console.log(rendered.map(l => `  ${clean(l)}`).join('\n'));
 console.log(`\nscreenshot: ${shot}`);
 
 const ok = /^\d+$/.test(today) && !pageErrors.length;
