@@ -121,6 +121,17 @@ node tests/live-check.mjs someuser ""    # built-in proxies only
 
 It exits `0` when today's count rendered as a number and `1` otherwise, and saves a screenshot to `live-check.png`. It runs from a terminal — GitHub Pages only serves `index.html`, so the script is not part of the published site.
 
+### Running it from GitHub
+
+The same check runs with nothing installed: **Actions → Live check → Run workflow**. Set it up once under **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `MAL_USERNAME` | your MAL username |
+| `MAL_PROXY` | your proxy, e.g. `https://<your-worker>.workers.dev/` (optional) |
+
+Both are masked in the run log, and either can be overridden for one run from the form (`none` as the proxy tests the built-in proxies only). The log still lists the manga titles on the rendered page. The screenshot is uploaded only if you tick the box, because it shows your username and the start of your proxy address — and on a public repository, logs and artifacts are visible to others.
+
 ## Deploy
 
 Any push to `main` triggers the GitHub Actions workflow at `.github/workflows/deploy-pages.yml`, which republishes the current `index.html` to GitHub Pages.

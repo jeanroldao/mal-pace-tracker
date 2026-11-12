@@ -1,0 +1,96 @@
+name: Live check
+
+# Runs tests/live-check.mjs on demand: the real page, in a real browser,
+# against the real MAL. Start it from the Actions tab → Live check → Run workflow.
+#
+# The username and proxy come from repository secrets so they stay out of the
+# repo and are masked in the log:
+#   Settings → Secrets and variables → Actions → New repository secret
+#     MAL_USERNAME   your MAL username
+#     MAL_PROXY      your proxy, e.g. https://<your-worker>.workers.dev/   (optional)
+# Either can be overridden for a single run with the inputs below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'MAL username (empty = MAL_USERNAME secret)'
+        required: false
+        type: string
+      proxy:
+        description: 'Proxy (empty = MAL_PROXY secret, "none" = built-in proxies only)'
+        required: false
+        type: string
+      goal:
+        description: 'Daily chapter goal'
+        required: false
+        default: '3'
+        type: string
+      screenshot:
+        description: 'Upload a screenshot (it shows your username and part of your proxy address)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  live-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      INPUT_USERNAME: ${{ inputs.username }}
+      INPUT_PROXY: ${{ inputs.proxy }}
+      INPUT_GOAL: ${{ inputs.goal }}
+      SECRET_USERNAME: ${{ secrets.MAL_USERNAME }}
+      SECRET_PROXY: ${{ secrets.MAL_PROXY }}
+    steps:
+      - name: Resolve settings
+        run: |
+          username="${INPUT_USERNAME:-$SECRET_USERNAME}"
+          proxy="${INPUT_PROXY:-$SECRET_PROXY}"
+          if [ "$proxy" = "none" ]; then proxy=""; fi
+          if [ -z "$username" ]; then
+            echo "::error::No MAL username. Add a MAL_USERNAME repository secret (Settings → Secrets and variables → Actions), or fill in the username input."
+            exit 1
+          fi
+          # Mask the values, and the proxy's bare hostname, wherever they are printed.
+          echo "::add-mask::$username"
+          if [ -n "$proxy" ]; then
+            echo "::add-mask::$proxy"
+            host="$(printf '%s' "$proxy" | sed -E 's#^[a-zA-Z]+://##; s#[/?].*$##')"
+            if [ -n "$host" ]; then echo "::add-mask::$host"; fi
+          fi
+          {
+            echo "MAL_USER=$username"
+            echo "MAL_PROXY=$proxy"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-package-lock playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run live check
+        env:
+          SETTLE_MS: '15000'
+          SCREENSHOT: live-check.png
+        run: node tests/live-check.mjs "$MAL_USER" "$MAL_PROXY" "${INPUT_GOAL:-3}"
+
+      - name: Upload screenshot
+        if: ${{ always() && inputs.screenshot }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-check-screenshot
+          path: live-check.png
+          if-no-files-found: ignore
+          retention-days: 7
