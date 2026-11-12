@@ -94,7 +94,10 @@ await page.waitForTimeout(Number(process.env.SETTLE_MS || 4000));
 const status   = (await page.textContent('#last-updated')).trim();
 // Ask the page itself, so values fixed in its CONFIG block are reported
 // (and redacted) rather than the arguments they override.
-const inUse    = await page.evaluate(() => ({ user: getUsername(), proxy: getProxy(), clientId: !!getClientId() }));
+const inUse    = await page.evaluate(() => ({
+  user: getUsername(), proxy: getProxy(), clientId: !!getClientId(),
+  proxyFixed: typeof isFixed === 'function' && isFixed('proxy'),
+}));
 const proxyUse = inUse.proxy;
 hideProxy(inUse.proxy.replace(/\{(url|raw)\}.*$/, ''));
 hide(inUse.user, '<user>');
@@ -110,8 +113,7 @@ await browser.close();
 server.close();
 
 console.log(`proxy entered : ${clean(proxy.trim()) || '(none)'}`);
-const proxyFixed = await page.evaluate(() => typeof isFixed === 'function' && isFixed('proxy'));
-console.log(`proxy used    : ${clean(proxyUse) || '(none)'}${proxyFixed ? '  (fixed by the page; argument ignored)' : ''}`);
+console.log(`proxy used    : ${clean(proxyUse) || '(none)'}${inUse.proxyFixed ? '  (fixed by the page; argument ignored)' : ''}`);
 console.log(`username used : ${clean(inUse.user)}${inUse.user !== username ? '  (fixed by the page; argument ignored)' : ''}`);
 console.log(`client ID     : ${inUse.clientId ? 'set' : 'none'}`);
 console.log(`status line   : ${clean(status)}`);
