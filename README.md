@@ -32,20 +32,20 @@ The app reads from several sources and uses whichever answers, so no single outa
 | Jikan `/users/{user}/history/manga` | which chapters were read on which day | nothing |
 | `myanimelist.net/history/{user}/manga` | the same, parsed from the page itself — live, with exact timestamps | a proxy, but **no key and no headers** |
 | Jikan `/users/{user}/statistics` | lifetime chapter total | nothing |
-| [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/mangalist` | per-manga chapter counts **and** `updatedAt`, with no proxy | nothing |
+| [jikan-edge](https://github.com/LucasHenriqueDiniz/jikan-edge) `/v1/users/{user}/mangalist` | per-manga chapter counts with no proxy — a cached copy, and with no usable `updatedAt` | nothing |
 | jikan-edge `/v1/users/{user}/statistics` | lifetime chapter total, when Jikan is down | nothing |
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
 Day-by-day numbers come from a history source when one is reachable: MAL's own history page parsed in the browser, then Jikan. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
 
-Jikan is last on purpose. It has been returning `504` on every endpoint since 2026-08-28, and it serves a cached copy even when healthy, so leading with it cost a wasted round trip per refresh and gave staler answers than MAL's own page.
+Jikan is last on purpose. It has been failing on every endpoint since 2026-08-28 (`504` at first, unreachable as of 2026-11-12), and it serves a cached copy even when healthy, so leading with it cost a wasted round trip per refresh and gave staler answers than MAL's own page.
 
 That ordering matters for accuracy, not just availability. A snapshot diff can only say "this changed between two refreshes", so chapters read last night and first seen by this morning's refresh get attributed to *this morning*. A history source timestamps each read, so it puts them on the night they happened. MAL's page is live (Jikan's copy is cached), so when it is the source it takes precedence even for today.
 
 **On jikan-edge:** an independent reimplementation reading the same public MAL pages, suggested on [jikan-rest#612](https://github.com/jikan-me/jikan-rest/issues/612) during the August 2026 outage. Two properties make it the most useful fallback here: it needs **no proxy** (it sends CORS headers), so it still works when MAL refuses the public proxies' datacenter IPs; and when its own upstream fetch fails it answers `200` with `stale: true` from cache rather than `504`.
 
-It cannot serve `/users/{user}/history` — that's on its documented list of routes it can't do — so the 7-day chart still falls back to snapshot diffs. But its `mangalist` route carries `updatedAt` per entry, which MAL's `load.json` doesn't, so day attribution near midnight is actually *better* through this path than through the public list.
+It cannot serve `/users/{user}/history` — that's on its documented list of routes it can't do — so the 7-day chart still falls back to snapshot diffs. Its `mangalist` route has an `updatedAt` field, but a live check on 2026-11-12 found it empty on every entry, so this path gives no help with day attribution. It is also a cached copy: with only jikan-edge reachable, today's count stays blank until two refreshes on different days give the snapshots something to diff. In practice it keeps the totals alive; it does not replace a working proxy.
 
 The two APIs disagree about shape — `{ data, meta }` vs `{ data, pagination }`, camelCase vs snake_case — so responses are read through parsers that accept either dialect and return nothing, rather than a misleading `0`, when they recognise neither.
 
@@ -101,7 +101,7 @@ The app **races** its proxies rather than trying them one at a time, and aborts 
    };
    ```
 
-3. Deploy, copy the worker URL, and paste `https://<your-worker>.workers.dev/?url=` into the app's **proxy** field. It's saved in `localStorage` and tried before the built-in list.
+3. Deploy, copy the worker URL, and paste it into the app's **proxy** field. A bare `https://<your-worker>.workers.dev/` is completed to `…/?url={url}` automatically. It's saved in `localStorage` and raced alongside the built-in list.
 
 The proxy field also accepts templates: `{url}` is replaced with the percent-encoded target and `{raw}` with the target as-is. A bare prefix (like the one above) gets the encoded target appended.
 

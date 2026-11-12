@@ -379,7 +379,7 @@ function loadSettings() {
   $('username-input').value  = localStorage.getItem(LS_USERNAME) || '';
   $('goal-input').value      = localStorage.getItem(LS_GOAL) || DEFAULT_GOAL;
   $('offset-input').value    = localStorage.getItem(LS_OFFSET) || 0;
-  $('proxy-input').value     = localStorage.getItem(LS_PROXY) || '';
+  $('proxy-input').value     = normalizeProxy(localStorage.getItem(LS_PROXY) || '');
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
 }
 
@@ -459,7 +459,9 @@ function saveSettings() {
   if (u) localStorage.setItem(LS_USERNAME, u);
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
   localStorage.setItem(LS_OFFSET, $('offset-input').value || 0);
-  localStorage.setItem(LS_PROXY, $('proxy-input').value.trim());
+  // Store, and show, the completed form so the field matches what is used.
+  $('proxy-input').value = getProxy();
+  localStorage.setItem(LS_PROXY, getProxy());
   const c = $('clientid-input').value.trim();
   if (c) localStorage.setItem(LS_CLIENTID, c);
 }
@@ -467,7 +469,23 @@ function saveSettings() {
 function getUsername() { return $('username-input').value.trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
 function getOffset()   { const v = parseInt($('offset-input').value, 10); return Number.isFinite(v) ? v : 0; }
-function getProxy()    { return $('proxy-input').value.trim(); }
+// The documented Worker reads its target from ?url=. Pasting just the
+// Worker's address is the natural thing to do, and it failed in the least
+// helpful way possible: the target went out as a path, the Worker answered
+// "missing ?url=" without CORS headers, and the browser reported only
+// "Failed to fetch". A bare workers.dev origin can't mean anything else, so
+// complete it rather than warn about it.
+function normalizeProxy(p) {
+  if (!p || /\{(url|raw)\}/.test(p)) return p;
+  try {
+    const u = new URL(/^[a-z]+:\/\//i.test(p) ? p : `https://${p}`);
+    if (/\.workers\.dev$/i.test(u.hostname) && u.pathname === '/' && !u.search) {
+      return `${u.origin}/?url={url}`;
+    }
+  } catch (_) { /* not a URL — leave it for proxyConfigWarning */ }
+  return p;
+}
+function getProxy()    { return normalizeProxy($('proxy-input').value.trim()); }
 function getClientId() { return $('clientid-input').value.trim(); }
 
 // Hostname of a proxy template, for readable error messages.
@@ -1174,8 +1192,8 @@ function render() {
       ? `<div class="error-msg">⚠ couldn't refresh — every source failed:<br>${latestFetchError.slice(0, 400)}${latestFetchError.length > 400 ? '…' : ''}<br><br>Showing what's stored locally${lastOkLabel ? `, last updated ${lastOkLabel}` : ''}. Retrying automatically.<br><br>${workerHelp}</div>`
       : (latestHistoryError
           ? `<div class="error-msg">⚠ couldn't load reading history (${latestHistoryError}). Past days fall back to local snapshot diffs. Retrying automatically.</div>`
-          : (noData > 0
-              ? `<div class="notice">ℹ no data for ${noData} day${noData > 1 ? 's' : ''} — past days come from Jikan's read of your MAL history page. A gap here usually means Jikan hadn't propagated yet at the time we fetched.</div>`
+          : (noData > 0 && latestHistorySource
+              ? `<div class="notice">ℹ ${noData} day${noData > 1 ? 's have' : ' has'} no entries in <strong>${latestHistorySource}</strong> — meaning nothing was logged on MAL ${noData > 1 ? 'those days' : 'that day'}. ${latestHistorySource === 'MAL history page' ? 'That page is live, so this is your real history, not a sync delay.' : 'If you did read, the source may not have caught up yet.'}</div>`
               : ''))}
     ${proxyWarning ? `<div class="error-msg">⚠ ${proxyWarning}.<br>Example: <strong>https://corsproxy.io/?key=YOUR_KEY&url={url}</strong></div>` : ''}
     ${cacheWarning}
