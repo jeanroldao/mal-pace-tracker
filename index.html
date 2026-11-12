@@ -230,7 +230,9 @@
 // written below can be read by anyone who opens it.
 const CONFIG = {
   username: 'jeanfarias',   // MAL username
-  proxy:    null,           // CORS proxy, e.g. 'https://<worker>.workers.dev/'
+  // CORS proxy. This Worker relays any URL it is given, and its address is
+  // public by being here — restrict it to myanimelist.net if it gets abused.
+  proxy:    'https://weathered-darkness-87c3.jeanroldao.workers.dev/',
   // MAL API client ID; '' = fixed to "none". Off on purpose: the page needs
   // no key, and the official API it unlocks reported 447 fewer chapters than
   // MAL's own list and profile (15176 vs 15623 on 2026-11-12), so the two

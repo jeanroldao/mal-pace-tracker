@@ -110,7 +110,8 @@ await browser.close();
 server.close();
 
 console.log(`proxy entered : ${clean(proxy.trim()) || '(none)'}`);
-console.log(`proxy used    : ${clean(proxyUse) || '(none)'}`);
+const proxyFixed = await page.evaluate(() => typeof isFixed === 'function' && isFixed('proxy'));
+console.log(`proxy used    : ${clean(proxyUse) || '(none)'}${proxyFixed ? '  (fixed by the page; argument ignored)' : ''}`);
 console.log(`username used : ${clean(inUse.user)}${inUse.user !== username ? '  (fixed by the page; argument ignored)' : ''}`);
 console.log(`client ID     : ${inUse.clientId ? 'set' : 'none'}`);
 console.log(`status line   : ${clean(status)}`);
