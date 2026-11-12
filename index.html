@@ -56,6 +56,7 @@
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 10px;
   }
+  .pill[hidden] { display: none; }
   .pill label { font-size: 11px; font-family: var(--mono); color: var(--muted); white-space: nowrap; }
   .pill input[type="number"] {
     width: 48px; border: none; background: transparent;
@@ -220,6 +221,31 @@
 </div>
 
 <script>
+// ── Personal configuration ────────────────────────────────────────────────
+// A value set here is the same in every browser and cannot be changed from
+// the page: its field is removed, and anything stored locally for it is
+// ignored. `null` leaves that setting editable and stored per browser.
+//
+// Nothing here is secret. This file *is* the published page — whatever is
+// written below can be read by anyone who opens it.
+const CONFIG = {
+  username: 'jeanfarias',   // MAL username
+  proxy:    null,           // CORS proxy, e.g. 'https://<worker>.workers.dev/'
+  // MAL API client ID; '' = fixed to "none". Off on purpose: the page needs
+  // no key, and the official API it unlocks reported 447 fewer chapters than
+  // MAL's own list and profile (15176 vs 15623 on 2026-11-12), so the two
+  // sources could not share one anchor.
+  clientId: '',
+  // Where pace is counted from. Fixed here so every browser agrees on it;
+  // per-browser anchors made a fresh browser start again from +0.
+  // The baseline was 14791 on the official API's scale; +447 puts it on the
+  // full-list scale used now, so pace carries on unchanged.
+  anchor:   { date: '2026-05-16', total: 15238 },
+  // Starting value only — the goal stays editable.
+  goal:     3,
+};
+const isFixed = key => CONFIG[key] !== null && CONFIG[key] !== undefined;
+
 const LS_USERNAME       = 'mal_tracker_username';
 const LS_GOAL           = 'mal_tracker_goal';
 const LS_OFFSET         = 'mal_tracker_offset';
@@ -233,7 +259,7 @@ const LS_LAST_SOURCE    = 'mal_last_source';
 const LS_LAST_OK        = 'mal_last_ok';
 const LS_SCHEMA_VERSION = 'mal_schema_version';
 const SCHEMA_VERSION = '4';
-const DEFAULT_GOAL = 10;
+const DEFAULT_GOAL = Number(CONFIG.goal) > 0 ? Number(CONFIG.goal) : 10;
 const AUTO_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const SNAP_KEEP_DAYS = 30;
 // When a refresh can't reach anything, retry on a backoff instead of going
@@ -381,6 +407,14 @@ function loadSettings() {
   $('offset-input').value    = localStorage.getItem(LS_OFFSET) || 0;
   $('proxy-input').value     = normalizeProxy(localStorage.getItem(LS_PROXY) || '');
   $('clientid-input').value  = localStorage.getItem(LS_CLIENTID) || '';
+  // Fixed settings: show nothing to edit. The getters below read CONFIG
+  // directly, so these fields are out of the picture entirely.
+  [['username', 'username-input'], ['proxy', 'proxy-input'], ['clientId', 'clientid-input']]
+    .forEach(([key, id]) => {
+      if (!isFixed(key)) return;
+      $(id).value = CONFIG[key];
+      $(id).closest('.pill').hidden = true;
+    });
 }
 
 // Drops keys left over from older schemas. Snapshots are deliberately kept:
@@ -431,6 +465,7 @@ function pruneOldSnapshots() {
 }
 
 function getAnchor() {
+  if (isFixed('anchor')) return { date: CONFIG.anchor.date, total: Number(CONFIG.anchor.total) };
   const date = localStorage.getItem(LS_ANCHOR_DATE);
   const totalStr = localStorage.getItem(LS_ANCHOR_TOTAL);
   if (!date || totalStr === null) return null;
@@ -439,10 +474,12 @@ function getAnchor() {
   return { date, total };
 }
 function setAnchor(date, total) {
+  if (isFixed('anchor')) return;
   localStorage.setItem(LS_ANCHOR_DATE, date);
   localStorage.setItem(LS_ANCHOR_TOTAL, String(total));
 }
 function clearAnchor() {
+  if (isFixed('anchor')) return;
   localStorage.removeItem(LS_ANCHOR_DATE);
   localStorage.removeItem(LS_ANCHOR_TOTAL);
 }
@@ -456,17 +493,17 @@ function daysBetween(fromStr, toStr) {
 
 function saveSettings() {
   const u = $('username-input').value.trim();
-  if (u) localStorage.setItem(LS_USERNAME, u);
+  if (u && !isFixed('username')) localStorage.setItem(LS_USERNAME, u);
   localStorage.setItem(LS_GOAL, $('goal-input').value || DEFAULT_GOAL);
   localStorage.setItem(LS_OFFSET, $('offset-input').value || 0);
   // Store, and show, the completed form so the field matches what is used.
   $('proxy-input').value = getProxy();
-  localStorage.setItem(LS_PROXY, getProxy());
+  if (!isFixed('proxy')) localStorage.setItem(LS_PROXY, getProxy());
   const c = $('clientid-input').value.trim();
-  if (c) localStorage.setItem(LS_CLIENTID, c);
+  if (c && !isFixed('clientId')) localStorage.setItem(LS_CLIENTID, c);
 }
 
-function getUsername() { return $('username-input').value.trim(); }
+function getUsername() { return (isFixed('username') ? String(CONFIG.username) : $('username-input').value).trim(); }
 function getGoal()     { return parseInt($('goal-input').value) || DEFAULT_GOAL; }
 function getOffset()   { const v = parseInt($('offset-input').value, 10); return Number.isFinite(v) ? v : 0; }
 // The documented Worker reads its target from ?url=. Pasting just the
@@ -485,8 +522,8 @@ function normalizeProxy(p) {
   } catch (_) { /* not a URL — leave it for proxyConfigWarning */ }
   return p;
 }
-function getProxy()    { return normalizeProxy($('proxy-input').value.trim()); }
-function getClientId() { return $('clientid-input').value.trim(); }
+function getProxy()    { return normalizeProxy((isFixed('proxy') ? String(CONFIG.proxy) : $('proxy-input').value).trim()); }
+function getClientId() { return (isFixed('clientId') ? String(CONFIG.clientId) : $('clientid-input').value).trim(); }
 
 // Hostname of a proxy template, for readable error messages.
 function proxyLabel(template) {
@@ -732,7 +769,7 @@ async function fetchMangaList(username, clientId) {
   // Explicit `updated_at` sub-field, and a cache-bust query param so the
   // CORS proxy can't hand us a stale response when the user just bumped
   // a chapter on MAL seconds ago.
-  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&fields=list_status{status,num_chapters_read,updated_at}&_=${Date.now()}`;
+  let url = `${MAL_API}/users/${username}/mangalist?limit=1000&nsfw=true&fields=list_status{status,num_chapters_read,updated_at}&_=${Date.now()}`;
   while (url) {
     const res = await fetchViaProxy(url, {
       headers: { 'X-MAL-CLIENT-ID': clientId },
@@ -780,49 +817,72 @@ function readChapterTotal(json) {
   return null;
 }
 
+// MAL shows a logged-out visitor absolute timestamps in Pacific time, not in
+// the visitor's own zone. Reading "Nov 3, 11:43 AM" as browser-local time
+// therefore lands hours off everywhere except the US west coast.
+const MAL_DISPLAY_TZ = 'America/Los_Angeles';
+
+// How far MAL's display zone is from UTC at a given instant (negative west).
+function malZoneOffsetMs(utcMs) {
+  try {
+    const p = {};
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: MAL_DISPLAY_TZ, hourCycle: 'h23',
+      year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', second: 'numeric',
+    }).formatToParts(new Date(utcMs)).forEach(x => { p[x.type] = Number(x.value); });
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
+         - Math.floor(utcMs / 1000) * 1000;
+  } catch (_) {
+    return -new Date(utcMs).getTimezoneOffset() * 6e4;   // no tz data: browser-local
+  }
+}
+
+// A wall-clock reading in MAL's display zone -> the real instant. Two passes
+// so a reading near a DST change resolves with the offset in force then.
+function malWallToUtc(year, month, day, hour, minute) {
+  const guess = Date.UTC(year, month, day, hour, minute);
+  return guess - malZoneOffsetMs(guess - malZoneOffsetMs(guess));
+}
+
 // MAL renders history timestamps as a mix of relative ("11 hours ago") and
-// absolute ("Aug 31, 3:52 PM") strings. Relative ones are timezone-proof,
-// which is exactly the form MAL uses for the last day — the window where
+// absolute ("Aug 31, 3:52 PM") strings. Relative ones need no timezone at
+// all, and they are the form MAL uses for the last day — the window where
 // the today/yesterday boundary actually matters.
 function parseMalHistoryDate(text, now = Date.now()) {
   let m;
   if ((m = text.match(/(\d+)\s*(second|minute|hour|day|week)s?\s+ago/i))) {
     const ms = { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5, week: 6048e5 };
-    return now - Number(m[1]) * ms[m[2].toLowerCase()];
+    const unit = m[2].toLowerCase();
+    // MAL rounds down, so "1 hour ago" covers 60-119 minutes. Taking it as
+    // exactly 60 dated a read from 23:40 as 00:30 when seen at 01:30. Aim
+    // for the middle of the range instead; minutes are precise enough as is.
+    const half = (unit === 'second' || unit === 'minute') ? 0 : ms[unit] / 2;
+    return now - Number(m[1]) * ms[unit] - half;
   }
 
   const t = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-  const withTime = d => {
-    if (t) {
-      let h = Number(t[1]) % 12;
-      if (/PM/i.test(t[3])) h += 12;
-      d.setHours(h, Number(t[2]), 0, 0);
-    } else {
-      d.setHours(12, 0, 0, 0);
-    }
-    return d.getTime();
-  };
+  const hour   = t ? (Number(t[1]) % 12) + (/PM/i.test(t[3]) ? 12 : 0) : 12;
+  const minute = t ? Number(t[2]) : 0;
+  const at = (y, mo, d) => malWallToUtc(y, mo, d, hour, minute);
+  // "Now" as MAL's wall clock, read back through the UTC getters.
+  const wall = new Date(now + malZoneOffsetMs(now));
+  const [wy, wm, wd] = [wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()];
 
-  if (/^\s*today/i.test(text))     return withTime(new Date(now));
-  if (/^\s*yesterday/i.test(text)) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - 1);
-    return withTime(d);
-  }
+  if (/^\s*today/i.test(text))     return at(wy, wm, wd);
+  if (/^\s*yesterday/i.test(text)) return at(wy, wm, wd - 1);
   // "Aug 31, 3:52 PM" — no year, so assume the most recent occurrence.
   if ((m = text.match(/^\s*([A-Za-z]{3})[a-z]*\s+(\d{1,2})/))) {
     const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
     const mo = months.indexOf(m[1].toLowerCase());
     if (mo >= 0) {
-      const d = new Date(now);
-      d.setMonth(mo, Number(m[2]));
-      if (d.getTime() > now + 864e5) d.setFullYear(d.getFullYear() - 1);
-      return withTime(d);
+      const when = at(wy, mo, Number(m[2]));
+      return when > now + 864e5 ? at(wy - 1, mo, Number(m[2])) : when;
     }
   }
   // "09-01-26, 3:52 PM"
   if ((m = text.match(/^\s*(\d{1,2})-(\d{1,2})-(\d{2})/))) {
-    return withTime(new Date(2000 + Number(m[3]), Number(m[1]) - 1, Number(m[2])));
+    return at(2000 + Number(m[3]), Number(m[1]) - 1, Number(m[2]));
   }
   return null;
 }
@@ -848,7 +908,7 @@ async function fetchMalHistoryPublic(username) {
     if (!link) return;                       // anime rows and headers
     const id = (link.getAttribute('href').match(/id=(\d+)/) || [])[1];
     if (!id) return;
-    const when = parseMalHistoryDate(cells[1].textContent || '');
+    const when = parseMalHistoryDate((cells[1].textContent || '').replace(/\u00a0/g, ' ').trim());
     if (!when) return;
     const strong = cells[0].querySelector('strong');
     out.push({
@@ -928,6 +988,18 @@ function detectJikanOffsetMs(mangaList, history) {
   offsets.sort((a, b) => a - b);
   const median = offsets[Math.floor(offsets.length / 2)];
   return Math.round(median / (30 * 60 * 1000)) * (30 * 60 * 1000);
+}
+
+// The offset correction above is for Jikan's re-labelled timestamps only.
+// MAL's own page is parsed into real instants already; running the detector
+// on it measured nothing but the gap between Pacific time and the browser's
+// zone, then shoved every read — today's exact ones included — by that many
+// hours. In a UTC+1 browser that pushed this evening's chapters into
+// tomorrow and left today at 0, but only once a client ID supplied the
+// updated_at values the detector feeds on.
+function historyOffsetMs(source, mangaList, history) {
+  if (source !== 'Jikan' || !history || !mangaList) return 0;
+  return detectJikanOffsetMs(mangaList, history);
 }
 
 // Group Jikan history entries by local calendar day after subtracting the
@@ -1072,7 +1144,7 @@ function render() {
   // using the app); today's count prefers snapshot diffs when MAL data is
   // present (real-time, no propagation lag). Snapshots fall back as a backup
   // for past days when Jikan returns nothing.
-  const jikanOffsetMs = (latestHistory && latestMangaList) ? detectJikanOffsetMs(latestMangaList, latestHistory) : 0;
+  const jikanOffsetMs = historyOffsetMs(latestHistorySource, latestMangaList, latestHistory);
   const jikanGrouped  = latestHistory ? buildJikanByDay(latestHistory, jikanOffsetMs) : { byDay: {}, titles: {} };
   Object.assign(titles, jikanGrouped.titles); // pick up titles for completed manga not in current MAL fetch
 
@@ -1224,7 +1296,7 @@ function render() {
       </div>
     </div>
 
-    ${anchor && haveTotal ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch · <button id="reset-anchor-btn">reset</button></div>` : ''}
+    ${anchor && haveTotal ? `<div class="anchor-info">anchor ${anchor.date} (day ${daysSinceAnchor}) · baseline ${anchor.total} ch · lifetime ${totalChapters - anchor.total >= 0 ? '+' : ''}${totalChapters - anchor.total} ch${isFixed('anchor') ? '' : ' · <button id="reset-anchor-btn">reset</button>'}</div>` : ''}
 
     <div class="section-label" style="margin-bottom:10px">last 7 days — right column = cumulative delta vs goal</div>
     <div class="days-table">
@@ -1463,7 +1535,7 @@ $('goal-input').addEventListener('input', () => { saveSettings(); render(); });
 $('offset-input').addEventListener('input', () => { saveSettings(); render(); });
 
 // A new proxy invalidates whichever one we'd settled on this session.
-$('proxy-input').addEventListener('input', () => { saveSettings(); workingProxy = null; });
+$('proxy-input').addEventListener('input', () => { saveSettings(); workingProxy.header = workingProxy.simple = null; });
 
 $('clientid-input').addEventListener('input', () => { saveSettings(); });
 

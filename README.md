@@ -21,6 +21,22 @@ On each **refresh** the tracker reads your public MAL reading history, and compa
 2. Type your **MAL username** and set your daily chapter **goal**. That's the whole setup.
 3. Click **↻ refresh** — your settings are saved in `localStorage` so you only need to enter them once.
 
+### Personal configuration
+
+The published page is one person's tracker. The `CONFIG` block at the top of the script in `index.html` fixes settings for every browser:
+
+| Key | Effect |
+| --- | --- |
+| `username` | the MAL account shown; the field is removed from the page |
+| `proxy` | the CORS proxy; `null` leaves it editable and stored per browser |
+| `clientId` | the MAL API client ID; `''` fixes it to "none" |
+| `anchor` | the date and lifetime total pace is counted from, so every browser shows the same pace |
+| `goal` | the starting daily goal (still editable) |
+
+A fixed value cannot be changed from the page and ignores anything stored in the browser. To change one, edit `CONFIG` and push. To use the page for another account, set the keys to `null`.
+
+**None of this is secret.** A static page has no private environment variables: whatever is in `CONFIG` is in the published HTML for anyone to read. That is why the client ID is fixed to none rather than written here, and why a proxy written here should only relay requests to MAL.
+
 ### Where the data comes from
 
 The app reads from several sources and uses whichever answers, so no single outage takes it down.
@@ -37,7 +53,7 @@ The app reads from several sources and uses whichever answers, so no single outa
 
 The public `load.json` endpoint leads, because it needs no key and no request headers — and therefore no CORS preflight, which is the thing that breaks most proxies. The official API is tried first only when you've set a custom proxy, since that's the case where it's likely to work; otherwise it's a fallback. Whichever source answers is named in the UI when it isn't the usual one.
 
-Day-by-day numbers come from a history source when one is reachable: MAL's own history page parsed in the browser, then Jikan. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
+Day-by-day numbers come from a history source when one is reachable: MAL's own history page parsed in the browser, then Jikan. MAL shows recent reads as relative times ("50 minutes ago") and older ones as absolute times in Pacific time, whatever zone the visitor is in, so the parser converts those from `America/Los_Angeles` before bucketing them into local days. Only if both fail are they reconstructed by diffing the daily snapshots stored locally on each refresh.
 
 Jikan is last on purpose. It has been failing on every endpoint since 2026-08-28 (`504` at first, unreachable as of 2026-11-12), and it serves a cached copy even when healthy, so leading with it cost a wasted round trip per refresh and gave staler answers than MAL's own page.
 

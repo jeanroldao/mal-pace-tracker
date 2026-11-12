@@ -7,6 +7,9 @@
 //   node tests/live-check.mjs someuser https://my-worker.me.workers.dev/
 //   node tests/live-check.mjs someuser ""        # built-in proxies only
 //
+// Settings fixed in the page's CONFIG block win over these arguments, exactly
+// as they do for a real visitor; the output shows the values actually in use.
+//
 // Needs Playwright:  npm i -g playwright && npx playwright install chromium
 // Env:  CHROME_PATH  use this Chromium binary instead of Playwright's own
 //       SETTLE_MS    extra wait after the list loads, for history (default 4000)
@@ -53,15 +56,15 @@ const host = url => { try { return new URL(url).host; } catch (_) { return url; 
 const redact = process.env.REDACT ? process.env.REDACT !== '0' : process.env.GITHUB_ACTIONS === 'true';
 const escapeRe = v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hidden = [];
-if (redact) {
-  const p = proxy.trim();
-  if (p) {
-    hidden.push([p, '<proxy>']);
-    const h = host(/^[a-z]+:\/\//i.test(p) ? p : `https://${p}`);
-    if (h) hidden.push([`https://${h}`, '<proxy>'], [h, '<proxy>']);
-  }
-  hidden.push([username, '<user>']);
-}
+const hide = (value, label) => { if (redact && value) hidden.push([value, label]); };
+const hideProxy = p => {
+  if (!p) return;
+  hide(p, '<proxy>');
+  const h = host(/^[a-z]+:\/\//i.test(p) ? p : `https://${p}`);
+  if (h) { hide(`https://${h}`, '<proxy>'); hide(h, '<proxy>'); }
+};
+hideProxy(proxy.trim());
+hide(username, '<user>');
 const clean = text => hidden.reduce(
   (t, [value, label]) => t.replace(new RegExp(escapeRe(value), 'gi'), label), String(text));
 page.on('request',        r => requests.set(r, { url: r.url(), outcome: 'pending' }));
@@ -89,7 +92,12 @@ await page.waitForFunction(
 await page.waitForTimeout(Number(process.env.SETTLE_MS || 4000));
 
 const status   = (await page.textContent('#last-updated')).trim();
-const proxyUse = await page.inputValue('#proxy-input');
+// Ask the page itself, so values fixed in its CONFIG block are reported
+// (and redacted) rather than the arguments they override.
+const inUse    = await page.evaluate(() => ({ user: getUsername(), proxy: getProxy(), clientId: !!getClientId() }));
+const proxyUse = inUse.proxy;
+hideProxy(inUse.proxy.replace(/\{(url|raw)\}.*$/, ''));
+hide(inUse.user, '<user>');
 const today    = (await page.textContent('.metric-value').catch(() => '')).trim();
 const banners  = await page.$$eval('#main-content .error-msg, #main-content .notice',
   els => els.map(e => [e.className.includes('error') ? 'ERROR ' : 'notice', e.innerText.replace(/\s+/g, ' ')]));
@@ -103,6 +111,8 @@ server.close();
 
 console.log(`proxy entered : ${clean(proxy.trim()) || '(none)'}`);
 console.log(`proxy used    : ${clean(proxyUse) || '(none)'}`);
+console.log(`username used : ${clean(inUse.user)}${inUse.user !== username ? '  (fixed by the page; argument ignored)' : ''}`);
+console.log(`client ID     : ${inUse.clientId ? 'set' : 'none'}`);
 console.log(`status line   : ${clean(status)}`);
 console.log(`today         : ${today}`);
 
