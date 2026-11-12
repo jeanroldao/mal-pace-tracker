@@ -107,6 +107,20 @@ The proxy field also accepts templates: `{url}` is replaced with the percent-enc
 
 > Your client ID is sent through whichever proxy is in use. It's a public-ish identifier rather than a secret — it grants read-only access to public list data and no account access — but running your own worker keeps it between you, Cloudflare, and MAL.
 
+## Debugging: the live check
+
+When the app misbehaves, `tests/live-check.mjs` shows why. It loads the real `index.html` in a real Chromium, lets it call the real MAL through the proxy you give it, and prints the proxy string actually used, every banner, every request with its outcome, and the rendered page. Nothing is stubbed.
+
+```sh
+npm i -g playwright && npx playwright install chromium   # once
+node tests/live-check.mjs <mal-username> [proxy] [goal]
+
+node tests/live-check.mjs someuser https://my-worker.me.workers.dev/
+node tests/live-check.mjs someuser ""    # built-in proxies only
+```
+
+It exits `0` when today's count rendered as a number and `1` otherwise, and saves a screenshot to `live-check.png`. It runs from a terminal — GitHub Pages only serves `index.html`, so the script is not part of the published site.
+
 ## Deploy
 
 Any push to `main` triggers the GitHub Actions workflow at `.github/workflows/deploy-pages.yml`, which republishes the current `index.html` to GitHub Pages.
